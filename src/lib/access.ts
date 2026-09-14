@@ -2,9 +2,14 @@ import { auth } from "@/auth";
 import { db } from "@/lib/db";
 import { redirect } from "next/navigation";
 
-export async function currentUserId() {
+export async function authenticatedUserId() {
   const session = await auth();
-  if (session?.user?.id) return session.user.id;
+  return session?.user?.id ?? null;
+}
+
+export async function currentUserId() {
+  const userId = await authenticatedUserId();
+  if (userId) return userId;
   if (process.env.DEMO_MODE === "true") {
     const user = await db.user.upsert({ where: { email: "demo@forge.local" }, update: {}, create: { email: "demo@forge.local", name: "Demo Founder" } });
     return user.id;

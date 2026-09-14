@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({ findAccount: vi.fn(), updateAccount: vi.fn() }));
 vi.mock("@/lib/db", () => ({ db: { account: { findFirst: mocks.findAccount, update: mocks.updateAccount } } }));
-import { githubToken } from "./github";
+import { githubToken, listRepositories } from "./github";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -32,5 +32,28 @@ describe("GitHub token handling", () => {
   it("asks for reauthentication when renewal is impossible", async () => {
     mocks.findAccount.mockResolvedValue({ providerAccountId: "account", access_token: "expired", refresh_token: null, expires_at: 1 });
     await expect(githubToken("user-id")).rejects.toThrow("Sign out and sign in again");
+  });
+
+  it("rejects a missing access token without calling GitHub", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    mocks.findAccount.mockResolvedValue({ access_token: null });
+    await expect(listRepositories("user-id")).rejects.toThrow("GitHub access is missing");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the persisted token to list both public and private repositories", async () => {
+    mocks.findAccount.mockResolvedValue({ access_token: "stored-token", expires_at: null });
+    const repositories = [{ id: 1, private: false }, { id: 2, private: true }];
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => repositories });
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await listRepositories("user-id")).toEqual(repositories);
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/user/repos?"), expect.objectContaining({ headers: expect.objectContaining({ Authorization: "Bearer stored-token" }) }));
+  });
+
+  it("asks for a new sign-in when GitHub rejects the persisted token", async () => {
+    mocks.findAccount.mockResolvedValue({ access_token: "invalid-token", expires_at: null });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 401 }));
+    await expect(listRepositories("user-id")).rejects.toThrow("authorization is no longer valid");
   });
 });

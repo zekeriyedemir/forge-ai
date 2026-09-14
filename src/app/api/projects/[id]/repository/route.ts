@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { currentUserId, projectForOwner } from "@/lib/access";
-import { listRepositories } from "@/lib/github";
+import { GitHubIntegrationError, listRepositories } from "@/lib/github";
 import { db } from "@/lib/db";
 
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -19,5 +19,5 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     await db.gitHubRepository.upsert({ where: { projectId: id }, create: { projectId: id, githubId: BigInt(repo.id), fullName: repo.full_name, url: repo.html_url, defaultBranch: repo.default_branch }, update: { githubId: BigInt(repo.id), fullName: repo.full_name, url: repo.html_url, defaultBranch: repo.default_branch } });
     await db.integration.upsert({ where: { workspaceId_type: { workspaceId: project.workspaceId, type: "GITHUB" } }, create: { workspaceId: project.workspaceId, type: "GITHUB" }, update: { status: "CONNECTED" } });
     return NextResponse.json({ ok: true });
-  } catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : "GitHub unavailable" }, { status: 502 }); }
+  } catch (error) { return NextResponse.json({ error: error instanceof GitHubIntegrationError ? error.message : "Could not link the GitHub repository. Try again." }, { status: 502 }); }
 }
