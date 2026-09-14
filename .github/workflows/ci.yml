@@ -13,11 +13,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npx prisma generate
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
-        env:
-          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/forge
-          AUTH_SECRET: ci-secret-that-is-longer-than-thirty-two-characters
