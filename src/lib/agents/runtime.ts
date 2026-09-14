@@ -22,6 +22,12 @@ export async function startWorkflow(projectId: string) {
 export async function advanceWorkflow(projectId: string, workflowId: string) {
   const run = await db.agentRun.findFirst({ where: { projectId, workflowId, status: { in: ["PENDING", "RUNNING"] } }, orderBy: { step: "asc" } });
   if (!run) return null;
+  if (run.status === "RUNNING") {
+    const staleBefore = new Date(Date.now() - 2 * 60 * 1000);
+    if (!run.startedAt || run.startedAt > staleBefore) return run;
+    const recovered = await db.agentRun.updateMany({ where: { id: run.id, status: "RUNNING", startedAt: { lt: staleBefore } }, data: { status: "PENDING", error: "Recovered stale execution" } });
+    if (recovered.count === 0) return run;
+  }
   const claimed = await db.agentRun.updateMany({ where: { id: run.id, status: "PENDING" }, data: { status: "RUNNING", startedAt: new Date() } });
   if (claimed.count === 0) return run;
   await db.agentEvent.create({ data: { runId: run.id, kind: "started", message: `${run.type.toLowerCase()} agent started` } });

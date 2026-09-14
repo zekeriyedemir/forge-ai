@@ -45,4 +45,13 @@ describe("workflow persistence", () => {
     expect(mocks.saveMetric).toHaveBeenCalledOnce();
     expect(mocks.updateRun).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "COMPLETED", provider: "mock" }) }));
   });
+  it("reclaims stale executions before generating again", async () => {
+    mocks.findRun.mockResolvedValue({ id: "run-id", type: "ANALYST", status: "RUNNING", startedAt: new Date(Date.now() - 5 * 60 * 1000) });
+    mocks.updateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 1 });
+    mocks.readContext.mockResolvedValue({ goals: [{ statement: "Build a useful service" }], tasks: [], reports: [], metrics: [] });
+    mocks.generate.mockResolvedValue({ summary: "Reviewed", tasks: [], reports: [], metrics: [] });
+    await advanceWorkflow("project-id", "workflow-id");
+    expect(mocks.updateMany).toHaveBeenCalledTimes(2);
+    expect(mocks.generate).toHaveBeenCalledOnce();
+  });
 });

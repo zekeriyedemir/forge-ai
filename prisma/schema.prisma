@@ -170,6 +170,7 @@ model Task {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   @@index([projectId, status])
+  @@unique([sourceRunId, title])
 }
 model Report {
   id String @id @default(uuid())
@@ -182,6 +183,7 @@ model Report {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   @@index([projectId, createdAt])
+  @@unique([sourceRunId, title])
 }
 model Metric {
   id String @id @default(uuid())

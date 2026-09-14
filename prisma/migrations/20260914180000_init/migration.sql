@@ -1,6 +1,3 @@
--- CreateSchema
-CREATE SCHEMA IF NOT EXISTS "public";
-
 -- CreateEnum
 CREATE TYPE "AgentType" AS ENUM ('FOUNDER', 'RESEARCH', 'DEVELOPER', 'ANALYST');
 
@@ -264,7 +261,13 @@ CREATE INDEX "AgentEvent_runId_createdAt_idx" ON "AgentEvent"("runId", "createdA
 CREATE INDEX "Task_projectId_status_idx" ON "Task"("projectId", "status");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "Task_sourceRunId_title_key" ON "Task"("sourceRunId", "title");
+
+-- CreateIndex
 CREATE INDEX "Report_projectId_createdAt_idx" ON "Report"("projectId", "createdAt");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Report_sourceRunId_title_key" ON "Report"("sourceRunId", "title");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Metric_projectId_key_key" ON "Metric"("projectId", "key");
