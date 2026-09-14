@@ -1,0 +1,229 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AgentType {
+  FOUNDER
+  RESEARCH
+  DEVELOPER
+  ANALYST
+}
+enum RunStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+enum IntegrationType {
+  GITHUB
+}
+
+model User {
+  id String @id @default(uuid())
+  name String?
+  email String? @unique
+  emailVerified DateTime?
+  image String?
+  accounts Account[]
+  sessions Session[]
+  memberships WorkspaceMember[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+model Account {
+  userId String
+  type String
+  provider String
+  providerAccountId String
+  refresh_token String? @db.Text
+  access_token String? @db.Text
+  expires_at Int?
+  token_type String?
+  scope String?
+  id_token String? @db.Text
+  session_state String?
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@id([provider, providerAccountId])
+}
+model Session {
+  sessionToken String @unique
+  userId String
+  expires DateTime
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@id([sessionToken])
+}
+model VerificationToken {
+  identifier String
+  token String
+  expires DateTime
+  @@id([identifier, token])
+}
+model Workspace {
+  id String @id @default(uuid())
+  name String
+  members WorkspaceMember[]
+  projects Project[]
+  integrations Integration[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+model WorkspaceMember {
+  id String @id @default(uuid())
+  workspaceId String
+  userId String
+  role String @default("OWNER")
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([workspaceId, userId])
+  @@index([userId])
+}
+model Project {
+  id String @id @default(uuid())
+  workspaceId String
+  name String
+  description String @default("") @db.Text
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  goals BusinessGoal[]
+  agents Agent[]
+  runs AgentRun[]
+  tasks Task[]
+  reports Report[]
+  metrics Metric[]
+  repositories GitHubRepository[]
+  activity ActivityEvent[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([workspaceId, createdAt])
+}
+model BusinessGoal {
+  id String @id @default(uuid())
+  projectId String
+  statement String @db.Text
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([projectId, createdAt])
+}
+model Agent {
+  id String @id @default(uuid())
+  projectId String
+  type AgentType
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  runs AgentRun[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([projectId, type])
+}
+model AgentRun {
+  id String @id @default(uuid())
+  projectId String
+  agentId String
+  workflowId String
+  step Int
+  type AgentType
+  input Json
+  output Json?
+  status RunStatus @default(PENDING)
+  model String?
+  provider String?
+  error String? @db.Text
+  startedAt DateTime?
+  completedAt DateTime?
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  events AgentEvent[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([workflowId, step])
+  @@index([projectId, createdAt])
+}
+model AgentEvent {
+  id String @id @default(uuid())
+  runId String
+  kind String
+  message String @db.Text
+  data Json?
+  run AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  @@index([runId, createdAt])
+}
+model Task {
+  id String @id @default(uuid())
+  projectId String
+  title String
+  description String @default("") @db.Text
+  status TaskStatus @default(TODO)
+  sourceRunId String?
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([projectId, status])
+  @@unique([sourceRunId, title])
+}
+model Report {
+  id String @id @default(uuid())
+  projectId String
+  title String
+  kind String
+  content String @db.Text
+  sourceRunId String?
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([projectId, createdAt])
+  @@unique([sourceRunId, title])
+}
+model Metric {
+  id String @id @default(uuid())
+  projectId String
+  key String
+  label String
+  value Float
+  unit String @default("")
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([projectId, key])
+}
+model Integration {
+  id String @id @default(uuid())
+  workspaceId String
+  type IntegrationType
+  status String @default("CONNECTED")
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([workspaceId, type])
+}
+model GitHubRepository {
+  id String @id @default(uuid())
+  projectId String @unique
+  githubId BigInt
+  fullName String
+  url String
+  defaultBranch String
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+model ActivityEvent {
+  id String @id @default(uuid())
+  projectId String
+  kind String
+  message String
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  @@index([projectId, createdAt])
+}
