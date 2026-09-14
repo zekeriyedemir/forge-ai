@@ -1,22 +1,32 @@
 import { AgentType } from "@prisma/client";
 import { db } from "@/lib/db";
-import { provider } from "./provider";
+import { AiProviderError, provider } from "./provider";
 import { tools } from "./tools";
 
 export const sequence: AgentType[] = ["FOUNDER", "RESEARCH", "FOUNDER", "DEVELOPER", "ANALYST"];
 
 export async function startWorkflow(projectId: string) {
-  const existing = await db.agentRun.findFirst({ where: { projectId, status: { in: ["PENDING", "RUNNING"] } } });
-  if (existing) return existing.workflowId;
-  const goal = await db.businessGoal.findFirst({ where: { projectId }, orderBy: { createdAt: "desc" } });
-  if (!goal) throw new Error("Add a business goal before starting the workflow");
-  const workflowId = crypto.randomUUID();
-  for (const [step, type] of sequence.entries()) {
-    const agent = await db.agent.upsert({ where: { projectId_type: { projectId, type } }, create: { projectId, type }, update: {} });
-    await db.agentRun.create({ data: { projectId, agentId: agent.id, workflowId, step, type, input: { goal: goal.statement } } });
+  try {
+    return await db.$transaction(async tx => {
+      const existing = await tx.agentRun.findFirst({ where: { projectId, status: { in: ["PENDING", "RUNNING"] } } });
+      if (existing) return existing.workflowId;
+      const goal = await tx.businessGoal.findFirst({ where: { projectId }, orderBy: { createdAt: "desc" } });
+      if (!goal) throw new Error("Add a business goal before starting the workflow");
+      const workflowId = crypto.randomUUID();
+      for (const [step, type] of sequence.entries()) {
+        const agent = await tx.agent.upsert({ where: { projectId_type: { projectId, type } }, create: { projectId, type }, update: {} });
+        await tx.agentRun.create({ data: { projectId, agentId: agent.id, workflowId, step, type, input: { goal: goal.statement } } });
+      }
+      await tx.activityEvent.create({ data: { projectId, kind: "workflow", message: "Workflow queued" } });
+      return workflowId;
+    }, { isolationLevel: "Serializable", maxWait: 10_000, timeout: 15_000 });
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "P2034") {
+      const existing = await db.agentRun.findFirst({ where: { projectId, status: { in: ["PENDING", "RUNNING"] } } });
+      if (existing) return existing.workflowId;
+    }
+    throw error;
   }
-  await db.activityEvent.create({ data: { projectId, kind: "workflow", message: "Workflow queued" } });
-  return workflowId;
 }
 
 export async function advanceWorkflow(projectId: string, workflowId: string) {
@@ -43,7 +53,8 @@ export async function advanceWorkflow(projectId: string, workflowId: string) {
     await db.agentEvent.create({ data: { runId: run.id, kind: "completed", message: result.summary } });
     await db.activityEvent.create({ data: { projectId, kind: "agent", message: `${run.type.toLowerCase()} agent: ${result.summary}` } });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown agent error";
+    const message = error instanceof AiProviderError ? error.message : "Agent execution failed. Please retry.";
+    console.error("Forge agent run failed", { runId: run.id, error });
     await db.agentRun.update({ where: { id: run.id }, data: { status: "FAILED", error: message, completedAt: new Date() } });
     await db.agentEvent.create({ data: { runId: run.id, kind: "failed", message } });
     await db.agentRun.updateMany({ where: { workflowId, projectId, status: "PENDING" }, data: { status: "FAILED", error: "Skipped because an earlier agent failed", completedAt: new Date() } });

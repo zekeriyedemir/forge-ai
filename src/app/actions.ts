@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { db } from "@/lib/db";
-import { requireProject, requireUser, workspaceForUser } from "@/lib/access";
+import { requireProjectOwner, requireUser, workspaceForUser } from "@/lib/access";
 import { goalInput, projectInput } from "@/lib/validation";
 
 export async function createProject(formData: FormData) {
@@ -16,7 +16,7 @@ export async function createProject(formData: FormData) {
 }
 
 export async function addGoal(projectId: string, formData: FormData) {
-  await requireProject(projectId);
+  await requireProjectOwner(projectId);
   const input = goalInput.parse(Object.fromEntries(formData));
   await db.businessGoal.create({ data: { projectId, statement: input.statement } });
   await db.activityEvent.create({ data: { projectId, kind: "goal", message: "Business goal updated" } });
@@ -24,7 +24,7 @@ export async function addGoal(projectId: string, formData: FormData) {
 }
 
 export async function updateTask(projectId: string, taskId: string, formData: FormData) {
-  await requireProject(projectId);
+  await requireProjectOwner(projectId);
   const status = formData.get("status");
   if (status !== "TODO" && status !== "IN_PROGRESS" && status !== "DONE") throw new Error("Invalid task status");
   await db.task.update({ where: { id: taskId, projectId }, data: { status } });

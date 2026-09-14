@@ -6,11 +6,14 @@ const mocks = vi.hoisted(() => ({
   readContext: vi.fn(), createTask: vi.fn(), createReport: vi.fn(), saveMetric: vi.fn(), generate: vi.fn(),
 }));
 
-vi.mock("@/lib/db", () => ({ db: {
-  agentRun: { findFirst: mocks.findRun, create: mocks.createRun, updateMany: mocks.updateMany, update: mocks.updateRun },
-  businessGoal: { findFirst: mocks.findGoal }, agent: { upsert: mocks.upsertAgent },
-  agentEvent: { create: mocks.createEvent }, activityEvent: { create: mocks.createActivity },
-} }));
+vi.mock("@/lib/db", () => {
+  const tx = {
+    agentRun: { findFirst: mocks.findRun, create: mocks.createRun, updateMany: mocks.updateMany, update: mocks.updateRun },
+    businessGoal: { findFirst: mocks.findGoal }, agent: { upsert: mocks.upsertAgent },
+    agentEvent: { create: mocks.createEvent }, activityEvent: { create: mocks.createActivity },
+  };
+  return { db: { ...tx, $transaction: (work: (client: typeof tx) => Promise<string>) => work(tx) } };
+});
 vi.mock("./tools", () => ({ tools: { readProjectContext: mocks.readContext, createTask: mocks.createTask, createReport: mocks.createReport, saveMetric: mocks.saveMetric } }));
 vi.mock("./provider", () => ({ provider: () => ({ name: "mock", model: "test", generate: mocks.generate }) }));
 
@@ -32,6 +35,12 @@ describe("workflow persistence", () => {
     mocks.findRun.mockResolvedValueOnce({ workflowId });
     expect(await startWorkflow("project-id")).toBe(workflowId);
     expect(mocks.createRun).toHaveBeenCalledTimes(5);
+  });
+
+  it("does not record a queued workflow when run creation fails", async () => {
+    mocks.createRun.mockRejectedValueOnce(new Error("Database write failed"));
+    await expect(startWorkflow("project-id")).rejects.toThrow("Database write failed");
+    expect(mocks.createActivity).not.toHaveBeenCalled();
   });
 
   it("claims a run once and persists output through scoped tools", async () => {

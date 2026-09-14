@@ -16,6 +16,8 @@ export interface AiProvider {
   generate(kind: AgentKind, goal: string, context: string): Promise<AgentResult>;
 }
 
+export class AiProviderError extends Error {}
+
 const mock: AiProvider = {
   name: "mock",
   model: "deterministic-demo",
@@ -32,13 +34,19 @@ const mock: AiProvider = {
 };
 
 export function provider(): AiProvider {
-  const env = serverEnv();
-  if (!env.OPENAI_API_KEY) return mock;
+  let env: ReturnType<typeof serverEnv>;
+  try { env = serverEnv(); }
+  catch { throw new AiProviderError("Server AI configuration is incomplete."); }
+  if (!env.OPENAI_API_KEY) {
+    if (env.DEMO_MODE === "true") return mock;
+    throw new AiProviderError("AI is not configured. Set OPENAI_API_KEY or enable DEMO_MODE.");
+  }
   return {
     name: "openai-compatible",
     model: env.OPENAI_MODEL,
     async generate(kind, goal, context) {
-      const response = await fetch(`${env.OPENAI_BASE_URL ?? "https://api.openai.com/v1"}/chat/completions`, {
+      let response: Response;
+      try { response = await fetch(`${(env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "")}/chat/completions`, {
         method: "POST",
         headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
         body: JSON.stringify({ model: env.OPENAI_MODEL, response_format: { type: "json_object" }, messages: [
@@ -46,10 +54,14 @@ export function provider(): AiProvider {
           { role: "user", content: `Business goal: ${goal}\nProject context: ${context}` },
         ] }),
         signal: AbortSignal.timeout(60_000),
-      });
-      if (!response.ok) throw new Error(`AI provider returned ${response.status}`);
-      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
-      return resultSchema.parse(JSON.parse(data.choices?.[0]?.message?.content ?? "{}"));
+      }); } catch { throw new AiProviderError("AI provider request timed out or could not connect."); }
+      if (response.status === 401 || response.status === 403) throw new AiProviderError("AI provider rejected its credentials or model access.");
+      if (response.status === 429) throw new AiProviderError("AI provider rate limit reached. Try again later.");
+      if (!response.ok) throw new AiProviderError(`AI provider request failed (${response.status}).`);
+      try {
+        const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+        return resultSchema.parse(JSON.parse(data.choices?.[0]?.message?.content ?? "{}"));
+      } catch { throw new AiProviderError("AI provider returned an invalid structured result."); }
     },
   };
 }
