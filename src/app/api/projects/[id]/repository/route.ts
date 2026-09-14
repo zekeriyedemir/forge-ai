@@ -1,14 +1,15 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { currentUserId, projectForUser } from "@/lib/access";
+import { currentUserId, projectForOwner } from "@/lib/access";
 import { listRepositories } from "@/lib/github";
 import { db } from "@/lib/db";
 
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
+  if (!z.uuid().safeParse(id).success) return NextResponse.json({ error: "Invalid project ID" }, { status: 400 });
   const userId = await currentUserId();
   if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  const project = await projectForUser(id, userId);
+  const project = await projectForOwner(id, userId);
   if (!project) return NextResponse.json({ error: "Not found" }, { status: 404 });
   const parsed = z.object({ repositoryId: z.number().int().positive() }).safeParse(await request.json().catch(() => null));
   if (!parsed.success) return NextResponse.json({ error: "Invalid repository" }, { status: 400 });

@@ -22,6 +22,10 @@ export async function projectForUser(projectId: string, userId: string) {
   return db.project.findFirst({ where: { id: projectId, workspace: { members: { some: { userId } } } } });
 }
 
+export async function projectForOwner(projectId: string, userId: string) {
+  return db.project.findFirst({ where: { id: projectId, workspace: { members: { some: { userId, role: "OWNER" } } } } });
+}
+
 export async function requireProject(projectId: string) {
   const userId = await requireUser();
   const project = await projectForUser(projectId, userId);
@@ -29,8 +33,15 @@ export async function requireProject(projectId: string) {
   return project;
 }
 
+export async function requireProjectOwner(projectId: string) {
+  const userId = await requireUser();
+  const project = await projectForOwner(projectId, userId);
+  if (!project) throw new Error("Project not found or access denied");
+  return project;
+}
+
 export async function workspaceForUser(userId: string) {
-  const member = await db.workspaceMember.findFirst({ where: { userId }, include: { workspace: true } });
+  const member = await db.workspaceMember.findFirst({ where: { userId, role: "OWNER" }, include: { workspace: true } });
   if (member) return member.workspace;
   return db.workspace.create({ data: { name: "My Workspace", members: { create: { userId, role: "OWNER" } } } });
 }
