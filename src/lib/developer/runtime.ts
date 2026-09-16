@@ -1,12 +1,32 @@
 import { Prisma } from "@prisma/client";
+import { ZodError } from "zod";
 import { db } from "@/lib/db";
 import { projectForOwner } from "@/lib/access";
 import { proposalSchema, featureBranch, safeTarget, shaSchema } from "./contracts";
 import { DeveloperGitHubError, developerGitHub, type DeveloperGitHub } from "./github";
 import { generateDeveloperProposal } from "./proposal";
+import { DeveloperProposalError, RepositoryValidationError, schemaFields, type ProposalFailureStage } from "./diagnostics";
 
 export class DeveloperFlowError extends Error {}
 const staleExecutionBefore = () => new Date(Date.now() - 15 * 60_000);
+
+async function proposalStep<T>(stage: ProposalFailureStage, code: string, fallback: string, work: () => Promise<T>): Promise<T> {
+  try { return await work(); }
+  catch (error) {
+    if (error instanceof DeveloperProposalError) throw error;
+    if (error instanceof RepositoryValidationError) throw new DeveloperProposalError("repository-validation", "REPOSITORY_LIMIT", error.message);
+    if (error instanceof DeveloperGitHubError || error instanceof DeveloperFlowError) throw new DeveloperProposalError(stage, code, error.message);
+    if (error instanceof ZodError) throw new DeveloperProposalError(stage, "INVALID_RESPONSE", `${fallback} (${schemaFields(error)}).`);
+    throw new DeveloperProposalError(stage, code, fallback);
+  }
+}
+
+async function recordProposalFailure(projectId: string, taskId: string, failure: DeveloperProposalError) {
+  // Diagnostic text is constructed only from fixed messages, status codes, and schema field names.
+  console.error("Forge Developer proposal failed", { projectId, taskId, stage: failure.stage, code: failure.code, reason: failure.message });
+  try { await db.activityEvent.create({ data: { projectId, kind: "developer-proposal-failed", message: `Task ${taskId}: ${failure.publicMessage}` } }); }
+  catch { console.error("Forge Developer proposal diagnostic persistence failed", { projectId, taskId, code: "DIAGNOSTIC_WRITE_FAILED" }); }
+}
 
 async function owner(projectId: string, userId: string) {
   if (!await projectForOwner(projectId, userId)) throw new DeveloperFlowError("Project not found or access denied.");
@@ -29,35 +49,46 @@ async function verifiedGitHub(projectId: string, userId: string, repositoryId?: 
 
 export async function createDeveloperProposal(projectId: string, taskId: string, userId: string, client?: DeveloperGitHub, generator = generateDeveloperProposal) {
   await owner(projectId, userId);
-  const task = await db.task.findFirst({ where: { id: taskId, projectId } });
-  if (!task) throw new DeveloperFlowError("Task not found in this project.");
-  const existing = await db.developerExecution.findFirst({ where: { projectId, taskId } });
-  if (existing) return existing;
-  const { linked, github, remote } = await verifiedGitHub(projectId, userId, undefined, client);
-  const target = await github.ref(linked.fullName, "dev") ? "dev" : safeTarget(remote.default_branch);
-  const baseSha = await github.ref(linked.fullName, target);
-  if (!baseSha) throw new DeveloperFlowError("The target branch is missing.");
-  const context = await github.context(linked.fullName, baseSha, `${task.title} ${task.description}`);
-  const proposal = proposalSchema.parse(await generator(`${task.title}\n${task.description}`, context));
-  const readable = new Map(context.files.map(file => [file.path, file.content]));
-  const existingPaths = new Set(context.paths);
-  if (proposal.files.some(file => existingPaths.has(file.path) && (!readable.has(file.path) || readable.get(file.path) === file.content))) throw new DeveloperFlowError("Proposal tried to replace an unread or unchanged file.");
-  const id = crypto.randomUUID();
-  const branch = featureBranch(task.title, id);
   try {
-    return await db.$transaction(async tx => {
-      const execution = await tx.developerExecution.create({ data: { id, projectId, taskId, runId: task.sourceRunId, repositoryId: linked.id, repositoryGithubId: linked.githubId, repositoryFullName: linked.fullName, branch, targetBranch: target, baseSha, proposal: proposal as Prisma.InputJsonValue, validationSummary: "Static path, size, and structured-output validation passed. Repository tests and CI have not run." } });
-      await tx.approvalRequest.create({ data: { projectId, executionId: id, runId: task.sourceRunId, action: "IMPLEMENT", requestedById: userId, description: `Implement ${proposal.task} in ${linked.fullName} on ${branch}`, payload: { branch, target, baseSha, files: proposal.files.map(file => ({ path: file.path, reason: file.reason })), summary: proposal.summary, risks: proposal.risks, validationPlan: proposal.validationPlan } } });
-      await tx.activityEvent.create({ data: { projectId, kind: "developer", message: `Developer proposal awaiting approval: ${proposal.task}` } });
-      return execution;
+    const task = await proposalStep("database", "TASK_LOOKUP_FAILED", "Could not load the selected task.", () => db.task.findFirst({ where: { id: taskId, projectId } }));
+    if (!task) throw new DeveloperProposalError("proposal-validation", "TASK_NOT_FOUND", "The selected task is no longer in this project.");
+    const existing = await proposalStep("database", "EXECUTION_LOOKUP_FAILED", "Could not check for an existing proposal.", () => db.developerExecution.findFirst({ where: { projectId, taskId } }));
+    if (existing) return existing;
+    const { linked, github, remote } = await proposalStep("github-inspection", "REPOSITORY_ACCESS_FAILED", "Could not inspect the linked GitHub repository.", () => verifiedGitHub(projectId, userId, undefined, client));
+    const { target, baseSha } = await proposalStep("branch-base", "BASE_RESOLUTION_FAILED", "Could not resolve the repository integration branch and base commit.", async () => {
+      const target = await github.ref(linked.fullName, "dev") ? "dev" : safeTarget(remote.default_branch);
+      const baseSha = await github.ref(linked.fullName, target);
+      if (!baseSha) throw new DeveloperProposalError("branch-base", "BASE_NOT_FOUND", "The selected integration branch has no readable base commit.");
+      return { target, baseSha };
     });
-  } catch (error) {
-    // The unique task constraint handles concurrent proposal requests without creating duplicate branches.
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-      const winner = await db.developerExecution.findFirst({ where: { projectId, taskId } });
-      if (winner) return winner;
+    const context = await proposalStep("github-inspection", "INSPECTION_FAILED", "Could not read the repository tree or source context.", () => github.context(linked.fullName, baseSha, `${task.title} ${task.description}`));
+    const generated = await proposalStep("ai-provider", "PROVIDER_FAILED", "The AI provider could not generate a proposal.", () => generator(`${task.title}\n${task.description}`, context));
+    const parsed = proposalSchema.safeParse(generated);
+    if (!parsed.success) throw new DeveloperProposalError("proposal-validation", "INVALID_PROPOSAL", `The proposal failed validation (${schemaFields(parsed.error)}).`);
+    const proposal = parsed.data;
+    const readable = new Map(context.files.map(file => [file.path, file.content]));
+    const existingPaths = new Set(context.paths);
+    if (proposal.files.some(file => existingPaths.has(file.path) && (!readable.has(file.path) || readable.get(file.path) === file.content))) throw new DeveloperProposalError("repository-validation", "UNINSPECTED_OR_UNCHANGED_FILE", "The proposal tried to replace an unread or unchanged repository file.");
+    const id = crypto.randomUUID();
+    const branch = featureBranch(task.title, id);
+    try {
+      return await db.$transaction(async tx => {
+        const execution = await tx.developerExecution.create({ data: { id, projectId, taskId, runId: task.sourceRunId, repositoryId: linked.id, repositoryGithubId: linked.githubId, repositoryFullName: linked.fullName, branch, targetBranch: target, baseSha, proposal: proposal as Prisma.InputJsonValue, validationSummary: "Static path, size, and structured-output validation passed. Repository tests and CI have not run." } });
+        await tx.approvalRequest.create({ data: { projectId, executionId: id, runId: task.sourceRunId, action: "IMPLEMENT", requestedById: userId, description: `Implement ${proposal.task} in ${linked.fullName} on ${branch}`, payload: { branch, target, baseSha, files: proposal.files.map(file => ({ path: file.path, reason: file.reason })), summary: proposal.summary, risks: proposal.risks, validationPlan: proposal.validationPlan } } });
+        await tx.activityEvent.create({ data: { projectId, kind: "developer", message: `Developer proposal awaiting approval: ${proposal.task}` } });
+        return execution;
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        const winner = await db.developerExecution.findFirst({ where: { projectId, taskId } });
+        if (winner) return winner;
+      }
+      throw new DeveloperProposalError("database", "PERSISTENCE_FAILED", "Could not save the proposal and approval request. No GitHub changes were made.");
     }
-    throw error;
+  } catch (error) {
+    const failure = error instanceof DeveloperProposalError ? error : new DeveloperProposalError("database", "UNEXPECTED_FAILURE", "Proposal processing failed before approval. No GitHub changes were made.");
+    await recordProposalFailure(projectId, taskId, failure);
+    throw failure;
   }
 }
 

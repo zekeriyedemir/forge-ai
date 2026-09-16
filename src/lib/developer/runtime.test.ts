@@ -1,8 +1,10 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- In-memory Prisma mock accepts multiple generated query shapes. */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DeveloperGitHub, PullInfo } from "./github";
+import { DeveloperGitHubError } from "./github";
+import { DeveloperProposalError, RepositoryValidationError } from "./diagnostics";
 
-const state = vi.hoisted(() => ({ owner: true, approvals: [] as Record<string, any>[], executions: [] as Record<string, any>[], task: { id: "task-id", projectId: "project-id", title: "Add task view", description: "Display tasks", sourceRunId: null }, linked: { id: "link-id", projectId: "project-id", githubId: BigInt(7), fullName: "owner/repo" }, events: [] as unknown[] }));
+const state = vi.hoisted(() => ({ owner: true, failTransaction: false, approvals: [] as Record<string, any>[], executions: [] as Record<string, any>[], task: { id: "task-id", projectId: "project-id", title: "Add task view", description: "Display tasks", sourceRunId: null }, linked: { id: "link-id", projectId: "project-id", githubId: BigInt(7), fullName: "owner/repo" }, events: [] as Record<string, unknown>[] }));
 
 vi.mock("@/lib/access", () => ({ projectForOwner: vi.fn(async () => state.owner ? { id: "project-id" } : null) }));
 vi.mock("@/lib/github", () => ({ githubToken: vi.fn() }));
@@ -26,7 +28,7 @@ vi.mock("@/lib/db", () => {
     },
     activityEvent: { create: vi.fn(async ({ data }: any) => { state.events.push(data); }) },
   };
-  return { db: { ...client, $transaction: async (work: (tx: typeof client) => Promise<unknown>) => work(client) } };
+  return { db: { ...client, $transaction: async (work: (tx: typeof client) => Promise<unknown>) => { if (state.failTransaction) throw new Error("private database URL leaked in raw error"); return work(client); } } };
 });
 
 import { createDeveloperProposal, decideApproval, executeImplementation, executeMerge, retryApproval } from "./runtime";
@@ -54,7 +56,7 @@ function fakeGitHub() {
   return { github, changePull: (next: Partial<PullInfo>) => { pull = { ...pull!, ...next }; } };
 }
 
-beforeEach(() => { vi.clearAllMocks(); state.owner = true; state.approvals.length = 0; state.executions.length = 0; state.events.length = 0; });
+beforeEach(() => { vi.clearAllMocks(); vi.spyOn(console, "error").mockImplementation(() => {}); state.owner = true; state.failTransaction = false; state.approvals.length = 0; state.executions.length = 0; state.events.length = 0; });
 
 describe("approved Developer execution", () => {
   it("runs proposal → approval → real branch/commit/PR → separate merge approval with fake GitHub", async () => {
@@ -166,5 +168,50 @@ describe("approved Developer execution", () => {
     await expect(createDeveloperProposal("project-id", "task-id", "user-id", github, async () => ({ ...proposal, files: [{ ...proposal.files[0], path: "../.env" }] }))).rejects.toThrow();
     expect(state.approvals).toHaveLength(0);
     expect(github.createBranch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["github-inspection", "REPOSITORY_ACCESS_FAILED", (github: DeveloperGitHub) => vi.mocked(github.repository).mockRejectedValueOnce(new DeveloperGitHubError("GitHub denied this operation."))],
+    ["branch-base", "BASE_RESOLUTION_FAILED", (github: DeveloperGitHub) => vi.mocked(github.ref).mockRejectedValueOnce(new DeveloperGitHubError("GitHub branch request failed."))],
+    ["repository-validation", "REPOSITORY_LIMIT", (github: DeveloperGitHub) => vi.mocked(github.context).mockRejectedValueOnce(new RepositoryValidationError("Repository tree has more than 500 entries; Forge cannot inspect it safely."))],
+    ["github-inspection", "INSPECTION_FAILED", (github: DeveloperGitHub) => vi.mocked(github.context).mockRejectedValueOnce(new DeveloperGitHubError("GitHub repository inspection failed."))],
+  ] as const)("persists sanitized %s diagnostics for %s", async (stage, code, fail) => {
+    const { github } = fakeGitHub();
+    fail(github);
+    await expect(createDeveloperProposal("project-id", "task-id", "user-id", github, async () => proposal)).rejects.toMatchObject({ stage, code });
+    expect(state.events).toContainEqual(expect.objectContaining({ kind: "developer-proposal-failed", message: expect.stringContaining(code) }));
+    expect(console.error).toHaveBeenCalledWith("Forge Developer proposal failed", expect.objectContaining({ stage, code }));
+    expect(state.approvals).toHaveLength(0);
+  });
+
+  it("distinguishes provider, structured-output, and final proposal validation failures", async () => {
+    const cases = [
+      { failure: new DeveloperProposalError("ai-provider", "RATE_LIMITED", "The AI provider rate limit was reached."), stage: "ai-provider", code: "RATE_LIMITED" },
+      { failure: new DeveloperProposalError("structured-output", "MALFORMED_JSON", "The AI returned invalid JSON after one retry."), stage: "structured-output", code: "MALFORMED_JSON" },
+    ];
+    for (const item of cases) {
+      const { github } = fakeGitHub();
+      await expect(createDeveloperProposal("project-id", "task-id", "user-id", github, async () => { throw item.failure; })).rejects.toMatchObject({ stage: item.stage, code: item.code });
+      expect(state.events.at(-1)).toMatchObject({ kind: "developer-proposal-failed", message: expect.stringContaining(item.code) });
+    }
+    const { github } = fakeGitHub();
+    await expect(createDeveloperProposal("project-id", "task-id", "user-id", github, async () => ({ ...proposal, files: [{ ...proposal.files[0], path: "../.env" }] }))).rejects.toMatchObject({ stage: "proposal-validation", code: "INVALID_PROPOSAL" });
+    expect(state.events.at(-1)?.message).toContain("files.0.path");
+  });
+
+  it("reports unread existing files as repository path validation failures", async () => {
+    const { github } = fakeGitHub();
+    vi.mocked(github.context).mockResolvedValueOnce({ paths: [proposal.files[0].path], files: [] });
+    await expect(createDeveloperProposal("project-id", "task-id", "user-id", github, async () => proposal)).rejects.toMatchObject({ stage: "repository-validation", code: "UNINSPECTED_OR_UNCHANGED_FILE" });
+    expect(state.events.at(-1)?.message).toContain("repository validation");
+  });
+
+  it("reports database persistence failures without leaking raw database errors", async () => {
+    const { github } = fakeGitHub();
+    state.failTransaction = true;
+    await expect(createDeveloperProposal("project-id", "task-id", "user-id", github, async () => proposal)).rejects.toMatchObject({ stage: "database", code: "PERSISTENCE_FAILED" });
+    expect(state.events.at(-1)?.message).not.toContain("private database URL");
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain("private database URL");
+    expect(state.approvals).toHaveLength(0);
   });
 });

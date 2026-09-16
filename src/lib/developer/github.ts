@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { githubToken } from "@/lib/github";
 import { branchSchema, safeTarget, shaSchema, type DeveloperProposal } from "./contracts";
+import { RepositoryValidationError } from "./diagnostics";
 
 const repoSchema = z.object({ id: z.number().int().positive(), full_name: z.string(), default_branch: z.string(), permissions: z.object({ push: z.boolean() }).optional() });
 const refSchema = z.object({ object: z.object({ sha: shaSchema }) });
@@ -60,9 +61,9 @@ export class GitHubDeveloperClient implements DeveloperGitHub {
     const root = repoPath(fullName);
     const commit = commitSchema.parse(await this.request(`${root}/git/commits/${shaSchema.parse(sha)}`));
     const tree = z.object({ truncated: z.boolean().optional(), tree: z.array(z.object({ path: z.string(), type: z.string(), mode: z.string(), size: z.number().optional() })).max(5000) }).parse(await this.request(`${root}/git/trees/${commit.tree.sha}?recursive=1`));
-    if (tree.truncated) throw new DeveloperGitHubError("Repository tree is too large to inspect safely.");
+    if (tree.truncated) throw new RepositoryValidationError("GitHub truncated the repository tree; Forge cannot inspect it safely.");
     const paths = tree.tree.map(item => item.path);
-    if (paths.length > 500) throw new DeveloperGitHubError("Repository contains more than 500 files; this bounded Developer workflow cannot inspect it safely.");
+    if (paths.length > 500) throw new RepositoryValidationError("Repository tree has more than 500 entries; Forge cannot inspect it safely.");
     const words = task.toLowerCase().split(/[^a-z0-9]+/).filter(word => word.length >= 4 && !["task", "with", "from", "that", "this", "create", "build"].includes(word));
     const selected = tree.tree.filter(item => item.type === "blob" && item.mode === "100644" && item.size !== undefined && item.size <= 12_000 && /^(?:README\.md|package\.json|(?:src|app|pages|components|lib|tests)\/.+\.(?:ts|tsx|js|jsx|css|md|json))$/.test(item.path))
       .sort((a, b) => {

@@ -5,7 +5,10 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { authenticatedUserId, projectForOwner } from "@/lib/access";
 import { db } from "@/lib/db";
-import { createDeveloperProposal, decideApproval, executeImplementation, executeMerge, retryApproval } from "@/lib/developer/runtime";
+import { DeveloperFlowError, createDeveloperProposal, decideApproval, executeImplementation, executeMerge, retryApproval } from "@/lib/developer/runtime";
+import { DeveloperProposalError } from "@/lib/developer/diagnostics";
+import { DeveloperGitHubError } from "@/lib/developer/github";
+import { AiProviderError } from "@/lib/agents/provider";
 
 async function identity(projectId: string) {
   z.uuid().parse(projectId);
@@ -22,7 +25,9 @@ function destination(projectId: string, error?: string) {
 }
 
 function message(error: unknown) {
-  return error instanceof Error && ["DeveloperFlowError", "AiProviderError", "DeveloperGitHubError"].includes(error.name) ? error.message : "Operation failed. Review the project activity and retry.";
+  if (error instanceof DeveloperProposalError) return error.publicMessage;
+  if (error instanceof DeveloperFlowError || error instanceof AiProviderError || error instanceof DeveloperGitHubError) return error.message;
+  return "Operation failed. Review the project activity and retry.";
 }
 
 export async function proposeDevelopment(projectId: string, formData: FormData) {
