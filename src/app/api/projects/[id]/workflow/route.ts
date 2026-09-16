@@ -38,7 +38,7 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     const runs = await db.agentRun.findMany({ where: { projectId: id, workflowId }, orderBy: { step: "asc" }, select: { id: true, type: true, status: true, error: true } });
     return NextResponse.json({ runs });
   } catch (error) {
-    console.error("Failed to advance Forge workflow", error);
+    console.error("Failed to advance Forge workflow", { reason: error instanceof Error ? error.name : "unknown" });
     return NextResponse.json({ error: "Agent execution failed. Check activity for details." }, { status: 500 });
   }
 }

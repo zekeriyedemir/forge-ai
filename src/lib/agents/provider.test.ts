@@ -29,11 +29,58 @@ describe("agent provider", () => {
     expect(await provider().generate("FOUNDER", "Build a useful service", "")).toEqual(output);
     expect(fetchMock.mock.calls[0][0]).toBe("https://example.test/v1/chat/completions");
     expect(fetchMock.mock.calls[0][1].headers.Authorization).toBe("Bearer test-only-key");
+    const request = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(request.response_format).toEqual({ type: "json_object" });
+    expect(request.messages[0].content).toContain("Metric keys must be unique ASCII lowercase snake_case");
   });
 
-  it("turns malformed provider output into a safe error", async () => {
+  it("accepts a complete JSON object wrapped in a markdown fence", async () => {
     config.apiKey = "test-only-key";
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "not JSON" } }] }) }));
-    await expect(provider().generate("ANALYST", "Build a useful service", "")).rejects.toThrow("invalid structured result");
+    const result = { summary: "Ready", tasks: [], reports: [], metrics: [{ key: "Monthly Active Users", label: "Monthly active users", value: 12, unit: "" }] };
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: `\n\`\`\`json\n${JSON.stringify(result)}\n\`\`\`\n` } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await provider().generate("ANALYST", "Build a useful service", "")).metrics[0].key).toBe("monthly_active_users");
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("retries one malformed response, then accepts a valid repair", async () => {
+    config.apiKey = "test-only-key";
+    const valid = { summary: "Ready", tasks: [], reports: [], metrics: [] };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: JSON.stringify({ summary: "missing arrays" }) } }] }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: JSON.stringify(valid) } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await provider().generate("FOUNDER", "Build a useful service", "")).toEqual(valid);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondRequest = JSON.parse(fetchMock.mock.calls[1][1].body);
+    expect(secondRequest.messages[2].content).toContain("Correct these fields");
+    expect(secondRequest.messages[2].content).not.toContain("missing arrays");
+  });
+
+  it("repairs an invalid model-generated metric key before returning output", async () => {
+    config.apiKey = "test-only-key";
+    const withKey = (key: string) => ({ summary: "Ready", tasks: [], reports: [], metrics: [{ key, label: "Monthly active users", value: 12, unit: "" }] });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: JSON.stringify(withKey("../unsafe")) } }] }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: JSON.stringify(withKey("Monthly Active Users")) } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await provider().generate("ANALYST", "Build a useful service", "")).metrics[0].key).toBe("monthly_active_users");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("turns repeated malformed provider output into a safe error after two attempts", async () => {
+    config.apiKey = "test-only-key";
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "not JSON" } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(provider().generate("ANALYST", "Build a useful service", "")).rejects.toThrow("invalid structured result after one retry");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry credential failures", async () => {
+    config.apiKey = "test-only-key";
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 401 });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(provider().generate("ANALYST", "Build a useful service", "")).rejects.toThrow("rejected its credentials");
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });
