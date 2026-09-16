@@ -170,6 +170,16 @@ describe("approved Developer execution", () => {
     expect(github.createBranch).not.toHaveBeenCalled();
   });
 
+  it("persists a malformed provider-envelope failure without any GitHub write or approval", async () => {
+    const { github } = fakeGitHub();
+    const failure = new DeveloperProposalError("ai-provider", "INVALID_COMPLETION_ENVELOPE", 'The provider returned an unusable envelope. Response structure: {"httpStatus":200,"choices":0,"content":"missing"}. No GitHub changes were made.');
+    await expect(createDeveloperProposal("project-id", "task-id", "user-id", github, async () => { throw failure; })).rejects.toBe(failure);
+    expect(state.events.at(-1)).toMatchObject({ kind: "developer-proposal-failed", message: expect.stringContaining("INVALID_COMPLETION_ENVELOPE") });
+    expect(state.approvals).toHaveLength(0);
+    expect(state.executions).toHaveLength(0);
+    for (const operation of [github.createBranch, github.createCommit, github.updateBranch, github.createPull, github.merge]) expect(operation).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["github-inspection", "REPOSITORY_ACCESS_FAILED", (github: DeveloperGitHub) => vi.mocked(github.repository).mockRejectedValueOnce(new DeveloperGitHubError("GitHub denied this operation."))],
     ["branch-base", "BASE_RESOLUTION_FAILED", (github: DeveloperGitHub) => vi.mocked(github.ref).mockRejectedValueOnce(new DeveloperGitHubError("GitHub branch request failed."))],

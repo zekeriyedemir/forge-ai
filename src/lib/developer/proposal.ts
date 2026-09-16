@@ -33,9 +33,62 @@ const completionSchema = z.object({
   choices: z.array(z.object({
     finish_reason: z.string().nullable().optional(),
     native_finish_reason: z.string().nullable().optional(),
-    message: z.object({ content: z.union([z.string(), z.array(z.object({ type: z.literal("text"), text: z.string() }))]).nullable().optional() }).optional(),
+    message: z.unknown().optional(),
+    error: z.unknown().optional(),
   })).min(1),
 });
+
+const textPartsSchema = z.array(z.object({ type: z.literal("text"), text: z.string() })).min(1);
+
+function object(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function safeFinishReason(value: unknown): string {
+  if (value === undefined) return "missing";
+  if (value === null) return "null";
+  if (typeof value !== "string") return "invalid-type";
+  return ["stop", "length", "content_filter", "tool_calls", "function_call", "max_tokens", "max_output_tokens"].includes(value.toLowerCase()) ? value.toLowerCase() : "other";
+}
+
+function safeModelSlug(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 120 || !/^[A-Za-z0-9][A-Za-z0-9._:-]*\/[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(value)) return null;
+  if (/\.{2}|(?:sk-|ghp_|gho_|github_pat_)/i.test(value)) return null;
+  return value;
+}
+
+function contentType(value: unknown, present: boolean): string {
+  if (!present) return "missing";
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+function envelopeFacts(payload: unknown, httpStatus: number) {
+  const root = object(payload);
+  const choices = root?.choices;
+  const first = Array.isArray(choices) ? object(choices[0]) : null;
+  const message = object(first?.message);
+  return {
+    httpStatus,
+    choices: Array.isArray(choices) ? choices.length > 100 ? "100+" : choices.length : choices === undefined ? "missing" : "invalid-type",
+    message: first?.message === undefined ? "missing" : message ? "object" : "invalid-type",
+    content: contentType(message?.content, Boolean(message && "content" in message)),
+    finishReason: safeFinishReason(first?.finish_reason),
+    nativeFinishReason: safeFinishReason(first?.native_finish_reason),
+    model: safeModelSlug(root?.model) ?? "unreported",
+    usagePresent: root?.usage !== undefined,
+    reasoningPresent: Boolean(message && (message.reasoning != null || message.reasoning_details != null || message.reasoning_content != null)),
+    toolCallsPresent: Boolean(message && message.tool_calls != null),
+    refusalPresent: Boolean(message && message.refusal != null),
+    providerErrorPresent: root?.error != null || first?.error != null,
+  };
+}
+
+function envelopeFailure(code: string, reason: string, payload: unknown, httpStatus: number) {
+  // Only fixed enums, counts, booleans, HTTP status, and a restricted model slug reach logs/activity.
+  return new DeveloperProposalError("ai-provider", code, `${reason} Response structure: ${JSON.stringify(envelopeFacts(payload, httpStatus))}. No GitHub changes were made.`);
+}
 
 function contextLimitError(value: unknown) {
   if (!value || typeof value !== "object") return false;
@@ -82,7 +135,7 @@ export async function generateDeveloperProposal(task: string, context: { paths: 
     { role: "system", content: `You are Forge's Developer Agent.\n${proposalContract}` },
     { role: "user", content: JSON.stringify({ task, paths: context.paths, readableFiles: context.files }) },
   ];
-  let invalid = new DeveloperProposalError("structured-output", "MALFORMED_RESPONSE", "The AI provider returned a malformed completion envelope after one retry. No GitHub changes were made.");
+  let invalid = new DeveloperProposalError("structured-output", "INVALID_RESULT", "The model did not provide a valid complete proposal after one retry. No GitHub changes were made.");
   for (let attempt = 0; attempt < 2; attempt++) {
     let response: Response;
     try {
@@ -102,15 +155,17 @@ export async function generateDeveloperProposal(task: string, context: { paths: 
     if (!response.ok) throw new DeveloperProposalError("ai-provider", "HTTP_ERROR", `The AI provider request failed (HTTP ${response.status}).`);
     const payload: unknown = await response.json().catch(() => null);
     if (contextLimitError(payload)) throw contextLimitFailure();
-    if (payload && typeof payload === "object" && "error" in payload) throw new DeveloperProposalError("ai-provider", "PROVIDER_ERROR", "The AI provider returned an error instead of a proposal. Check provider availability and model settings. No GitHub changes were made.");
+    if (object(payload)?.error != null) throw new DeveloperProposalError("ai-provider", "PROVIDER_ERROR", "The AI provider returned an error instead of a proposal. Check provider availability and model settings. No GitHub changes were made.");
     const completion = completionSchema.safeParse(payload);
     if (!completion.success) {
-      invalid = new DeveloperProposalError("structured-output", "MALFORMED_RESPONSE", "The AI provider returned a malformed completion envelope after one retry. No GitHub changes were made.");
-      if (attempt === 0) messages.push({ role: "user", content: `Return one complete JSON chat message matching this contract, with no prose or partial files.\n${proposalContract}` });
-      continue;
+      throw envelopeFailure("INVALID_COMPLETION_ENVELOPE", "The provider did not return a usable Chat Completions envelope. Check the selected model and provider route.", payload, response.status);
     }
     const choice = completion.data.choices[0];
-    const raw = typeof choice.message?.content === "string" ? choice.message.content : choice.message?.content?.map(part => part.text).join("");
+    if (choice.error != null) throw envelopeFailure("PROVIDER_ERROR", "The provider returned an error inside the completion choice. Check the selected model and provider route.", payload, response.status);
+    const message = object(choice.message);
+    const content = message?.content;
+    const textParts = Array.isArray(content) ? textPartsSchema.safeParse(content) : null;
+    const raw = typeof content === "string" ? content : textParts?.success ? textParts.data.map(part => part.text).join("") : undefined;
     const usage = z.object({ completion_tokens: z.number().int().nonnegative() }).safeParse(completion.data.usage);
     let previousValidFields: Record<string, string> = {};
     let failingFields = "not available";
@@ -122,7 +177,12 @@ export async function generateDeveloperProposal(task: string, context: { paths: 
       continue;
     }
     if (choice.finish_reason === "content_filter") throw new DeveloperProposalError("ai-provider", "CONTENT_FILTERED", "The provider filtered the proposal response. No GitHub changes were made.");
-    if (choice.finish_reason && choice.finish_reason !== "stop") throw new DeveloperProposalError("ai-provider", "UNEXPECTED_FINISH", "The provider ended without a completed text proposal. No GitHub changes were made.");
+    if (choice.finish_reason && choice.finish_reason !== "stop") throw envelopeFailure("UNEXPECTED_FINISH", "The provider ended without a completed text proposal. Choose a model that returns a final JSON text response.", payload, response.status);
+    if (!message) throw envelopeFailure("MISSING_MESSAGE", "The provider omitted the assistant message. Try a fixed JSON-capable model instead of a rotating model route.", payload, response.status);
+    if (typeof message.refusal === "string" && message.refusal.trim()) throw envelopeFailure("MODEL_REFUSAL", "The model refused to produce a proposal. Choose a supported task or model.", payload, response.status);
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) throw envelopeFailure("UNEXPECTED_TOOL_CALL", "The model returned a tool call, but Developer proposals require final JSON text. Choose a JSON-capable text model.", payload, response.status);
+    if (content !== undefined && content !== null && raw === undefined) throw envelopeFailure("UNSUPPORTED_CONTENT", "The provider returned non-text content instead of a JSON proposal. Choose a text-output model that supports Chat Completions JSON mode.", payload, response.status);
+    if (!raw?.trim() && (message.reasoning != null || message.reasoning_details != null || message.reasoning_content != null || message.tool_calls != null || message.refusal != null)) throw envelopeFailure("NO_FINAL_CONTENT", "The provider returned reasoning, a tool call, or a refusal without final proposal text. Choose a model that returns a final JSON text response.", payload, response.status);
     if (typeof raw !== "string" || !raw.trim()) invalid = new DeveloperProposalError("structured-output", "EMPTY_CONTENT", "The model returned no proposal text after one retry. Check that the selected model supports JSON text output. No GitHub changes were made.");
     else if (raw.length > 200_000) invalid = new DeveloperProposalError("structured-output", "RESPONSE_TOO_LARGE", "The model response exceeded Forge's response-size limit. Choose a smaller task. No GitHub changes were made.");
     else {

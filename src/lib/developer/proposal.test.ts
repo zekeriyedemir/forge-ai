@@ -20,6 +20,7 @@ describe("Developer structured output", () => {
     expect(body.messages[1].content).not.toContain("ghp_");
     expect(body.max_completion_tokens).toBe(8192);
     expect(body.max_tokens).toBeUndefined();
+    expect(body.response_format).toEqual({ type: "json_object" });
     const system = body.messages[0].content as string;
     for (const required of ["files[*].path", "validationPlan: ONE JSON string", "risks: ONE JSON string", "commitMessage: ONE JSON string", "COMPLETE final text", "64000 characters"]) expect(system).toContain(required);
     const example = system.split("Valid complete example: ")[1].split("\n")[0];
@@ -30,6 +31,89 @@ describe("Developer structured output", () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: "stop", message: { content: [{ type: "text", text: JSON.stringify(proposal) }] } }] }) });
     vi.stubGlobal("fetch", fetchMock);
     expect(await generateDeveloperProposal("Improve home page", context)).toEqual(proposal);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("accepts a standard non-streaming OpenAI Chat Completion envelope", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ id: "chatcmpl-test", object: "chat.completion", model: "gpt-4o-mini", usage: { prompt_tokens: 10, completion_tokens: 25, total_tokens: 35 }, choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: JSON.stringify(proposal), refusal: null } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await generateDeveloperProposal("Improve home page", context)).toEqual(proposal);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("accepts an OpenRouter-routed completion with extra routing and reasoning metadata", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ object: "chat.completion", model: "vendor/model:free", openrouter_metadata: { provider_name: "provider" }, usage: { prompt_tokens: 50, completion_tokens: 100, cost: 0 }, choices: [{ index: 0, finish_reason: "stop", native_finish_reason: "eos", message: { role: "assistant", content: JSON.stringify(proposal), reasoning_details: [{ type: "reasoning.text", text: "private reasoning" }] } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await generateDeveloperProposal("Improve home page", context)).toEqual(proposal);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["missing choices", { model: "vendor/model:free", usage: { completion_tokens: 10 } }, '"choices":"missing"'],
+    ["empty choices", { model: "vendor/model:free", choices: [] }, '"choices":0'],
+    ["invalid first choice", { model: "vendor/model:free", choices: [null] }, '"message":"missing"'],
+  ])("rejects %s immediately with safe envelope structure", async (_case, envelope, expectedFact) => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => envelope });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ stage: "ai-provider", code: "INVALID_COMPLETION_ENVELOPE", message: expect.stringContaining(expectedFact) });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an absent assistant message rather than treating it as a repairable proposal", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ model: "vendor/model:free", choices: [{ finish_reason: "stop" }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ stage: "ai-provider", code: "MISSING_MESSAGE", message: expect.stringContaining('"model":"vendor/model:free"') });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("does not repeat a secret-like model identifier or finish reason in envelope diagnostics", async () => {
+    const secretLike = "sk-this-value-must-stay-private";
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ model: `vendor/${secretLike}`, choices: [{ finish_reason: secretLike, native_finish_reason: 17, message: 17 }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    try { await generateDeveloperProposal("Improve home page", context); throw new Error("Expected rejection"); }
+    catch (error) {
+      expect(error).toMatchObject({ code: "INVALID_COMPLETION_ENVELOPE" });
+      expect((error as Error).message).toContain('"finishReason":"other"');
+      expect((error as Error).message).toContain('"model":"unreported"');
+      expect((error as Error).message).not.toContain(secretLike);
+    }
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("rejects unsupported non-text content without reflecting it in diagnostics", async () => {
+    const privateValue = "sensitive repository text";
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ model: "vendor/model:free", choices: [{ finish_reason: "stop", message: { content: [{ type: "image_url", image_url: privateValue }] } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    try { await generateDeveloperProposal("Improve home page", context); throw new Error("Expected rejection"); }
+    catch (error) {
+      expect(error).toMatchObject({ stage: "ai-provider", code: "UNSUPPORTED_CONTENT" });
+      expect((error as Error).message).toContain('"content":"array"');
+      expect((error as Error).message).not.toContain(privateValue);
+    }
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("rejects reasoning without final content and never treats reasoning as proposal JSON", async () => {
+    const privateValue = JSON.stringify(proposal);
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: "stop", message: { content: null, reasoning: privateValue } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    try { await generateDeveloperProposal("Improve home page", context); throw new Error("Expected rejection"); }
+    catch (error) {
+      expect(error).toMatchObject({ stage: "ai-provider", code: "NO_FINAL_CONTENT" });
+      expect((error as Error).message).toContain('"reasoningPresent":true');
+      expect((error as Error).message).not.toContain(privateValue);
+    }
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["PROVIDER_ERROR", { error: { message: "sensitive provider failure" }, finish_reason: "stop", message: { content: JSON.stringify(proposal) } }],
+    ["MODEL_REFUSAL", { finish_reason: "stop", message: { content: JSON.stringify(proposal), refusal: "sensitive refusal text" } }],
+    ["UNEXPECTED_TOOL_CALL", { finish_reason: "stop", message: { content: JSON.stringify(proposal), tool_calls: [{ id: "sensitive tool data" }] } }],
+  ])("rejects %s even when a choice includes valid-looking proposal text", async (code, choice) => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [choice] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ stage: "ai-provider", code });
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
@@ -95,12 +179,6 @@ describe("Developer structured output", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("classifies a missing message as empty content when the provider reports a normal stop", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: "stop" }] }) });
-    vi.stubGlobal("fetch", fetchMock);
-    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ code: "EMPTY_CONTENT" });
-  });
-
   it("discards a truncated response and retries with a minimal complete-change instruction", async () => {
     const truncated = "partial sensitive file content";
     const fetchMock = vi.fn()
@@ -113,6 +191,13 @@ describe("Developer structured output", () => {
     expect(retry.messages.at(-1).content).toContain("smallest complete implementation");
     expect(JSON.stringify(retry)).not.toContain(truncated);
     expect(JSON.stringify(retry)).not.toContain("Invalid fields:");
+  });
+
+  it("recognizes a length stop even when the provider omits the message", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: "length" }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ code: "TRUNCATED" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("reports repeated truncation even when the provider returns partial JSON or native metadata", async () => {
