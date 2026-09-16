@@ -32,6 +32,29 @@ enum IntegrationType {
   GITHUB
 }
 
+enum ApprovalAction {
+  IMPLEMENT
+  MERGE
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  EXECUTING
+  REJECTED
+  EXECUTED
+  FAILED
+}
+
+enum DeveloperStatus {
+  PROPOSED
+  BRANCH_CREATED
+  COMMITTED
+  PR_OPEN
+  MERGED
+  FAILED
+}
+
 model User {
   id            String            @id @default(uuid())
   name          String?
@@ -41,6 +64,8 @@ model User {
   accounts      Account[]
   sessions      Session[]
   memberships   WorkspaceMember[]
+  requestedApprovals ApprovalRequest[] @relation("RequestedApprovals")
+  decidedApprovals ApprovalRequest[] @relation("DecidedApprovals")
   createdAt     DateTime          @default(now())
   updatedAt     DateTime          @updatedAt
 }
@@ -117,6 +142,8 @@ model Project {
   metrics      Metric[]
   repositories GitHubRepository[]
   activity     ActivityEvent[]
+  approvals    ApprovalRequest[]
+  executions   DeveloperExecution[]
   createdAt    DateTime           @default(now())
   updatedAt    DateTime           @updatedAt
 
@@ -164,6 +191,8 @@ model AgentRun {
   project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
   agent       Agent        @relation(fields: [agentId], references: [id], onDelete: Cascade)
   events      AgentEvent[]
+  approvals   ApprovalRequest[]
+  executions  DeveloperExecution[]
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
 
@@ -191,6 +220,7 @@ model Task {
   status      TaskStatus @default(TODO)
   sourceRunId String?
   project     Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  executions  DeveloperExecution[]
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
 
@@ -247,6 +277,7 @@ model GitHubRepository {
   url           String
   defaultBranch String
   project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  executions    DeveloperExecution[]
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 }
@@ -260,4 +291,63 @@ model ActivityEvent {
   createdAt DateTime @default(now())
 
   @@index([projectId, createdAt])
+}
+
+model ApprovalRequest {
+  id            String         @id @default(uuid())
+  projectId     String
+  runId         String?
+  executionId   String
+  action        ApprovalAction
+  status        ApprovalStatus @default(PENDING)
+  description   String         @db.Text
+  payload       Json
+  requestedById String
+  decidedById   String?
+  requestedAt   DateTime       @default(now())
+  decidedAt     DateTime?
+  executedAt    DateTime?
+  updatedAt     DateTime       @updatedAt
+  error         String?        @db.Text
+  project       Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  run           AgentRun?      @relation(fields: [runId], references: [id], onDelete: SetNull)
+  execution     DeveloperExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  requestedBy   User           @relation("RequestedApprovals", fields: [requestedById], references: [id])
+  decidedBy     User?          @relation("DecidedApprovals", fields: [decidedById], references: [id])
+
+  @@unique([executionId, action])
+  @@index([projectId, status, requestedAt])
+}
+
+model DeveloperExecution {
+  id                String          @id @default(uuid())
+  projectId         String
+  runId             String?
+  taskId            String?
+  repositoryId      String
+  repositoryGithubId BigInt
+  repositoryFullName String
+  status            DeveloperStatus @default(PROPOSED)
+  proposal          Json
+  branch            String          @unique
+  targetBranch      String
+  baseSha           String
+  commitSha         String?
+  pullNumber        Int?
+  pullUrl           String?
+  pullState         String?
+  validationSummary String?         @db.Text
+  error             String?         @db.Text
+  startedAt         DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  project           Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  repository        GitHubRepository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  task              Task?            @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  run               AgentRun?       @relation(fields: [runId], references: [id], onDelete: SetNull)
+  approvals         ApprovalRequest[]
+
+  @@index([projectId, createdAt])
+  @@unique([projectId, taskId])
 }
