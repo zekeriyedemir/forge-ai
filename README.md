@@ -21,8 +21,10 @@ For a credential-free demo, set `DEMO_MODE=true` and leave `OPENAI_API_KEY` empt
 
 For live AI, set `OPENAI_API_KEY` and choose an OpenAI-compatible `OPENAI_BASE_URL` and `OPENAI_MODEL` that support Chat Completions JSON mode. The key stays on the server. No real AI call is needed to run tests.
 
-GitHub login requires `AUTH_GITHUB_ID` and `AUTH_GITHUB_SECRET` from a GitHub OAuth app. Add `http://localhost:3000/api/auth/callback/github` as its local callback. Auth.js v5 infers the normal host, so `AUTH_URL` is usually unnecessary. Sign in with GitHub to list repositories and link one to a project; a demo-only session cannot access GitHub repositories. See [deployment](docs/deployment.md) for production callback setup.
+GitHub login requires `AUTH_GITHUB_ID` and `AUTH_GITHUB_SECRET` from a GitHub OAuth app. Add `http://localhost:3000/api/auth/callback/github` as its local callback. Auth.js v5 infers the normal host, so `AUTH_URL` is usually unnecessary. After signing in, open **Dashboard → Integrations** to see your authorized public and private repositories even before creating a project. Create a project to link one. A demo-only session cannot access GitHub repositories. Signed-in project owners can permanently delete a project under **Project → Settings** by typing its exact name; deletion also removes its goals, workflows, tasks, reports, metrics, activity, and repository link. See [deployment](docs/deployment.md) for production callback setup.
 
 ## Validation and deployment
 
 Run `npm run lint`, `npm run typecheck`, `npm test`, and `npm run build`. Playwright demo tests (`npm run test:e2e`) require a migrated local database and Chromium (`npx playwright install chromium`); anonymous protection checks (`npm run test:e2e:auth`) need a browser but no database queries. To use an installed Chrome instead of Playwright's Chromium, set `PLAYWRIGHT_BROWSER_CHANNEL=chrome`. GitHub Actions runs lint, typecheck, unit tests, and the production build. See [security](docs/security.md), [deployment](docs/deployment.md), and [roadmap](docs/roadmap.md).
+
+The optional cascade integration test creates and removes temporary records in the configured database. Run it only against a database where that is acceptable: `RUN_DB_INTEGRATION=true node --env-file=.env node_modules/vitest/vitest.mjs run tests/integration/project-delete.test.ts`.
