@@ -1,26 +1,31 @@
 import { z } from "zod";
 
-const safePath = z.string().min(1).max(180).refine(path => {
-  if (path.includes("\\") || path.includes("..") || path.startsWith("/") || /[\u0000-\u001f\u007f]/.test(path)) return false;
-  const parts = path.split("/");
-  if (parts.some(part => !part || part.startsWith(".") || !/^(?:[A-Za-z0-9_-]+|\[[A-Za-z0-9_-]+\])(?:\.[A-Za-z0-9_-]+)*$/.test(part))) return false;
-  return ["src", "app", "pages", "components", "lib", "tests", "docs"].includes(parts[0]) && /\.(?:ts|tsx|js|jsx|css|md|json)$/.test(path);
-}, "Only ordinary text source, test, and documentation paths are supported");
+const safePath = z.string()
+  .transform(path => {
+    const trimmed = path.trim();
+    return trimmed.startsWith("./") ? trimmed.slice(2) : trimmed;
+  })
+  .pipe(z.string().min(1).max(180).refine(path => {
+    if (path.includes("\\") || path.includes("..") || path.startsWith("/") || /[\u0000-\u001f\u007f]/.test(path)) return false;
+    const parts = path.split("/");
+    if (parts.some(part => !part || part.startsWith(".") || !/^(?:[A-Za-z0-9_-]+|\[[A-Za-z0-9_-]+\])(?:\.[A-Za-z0-9_-]+)*$/.test(part))) return false;
+    return ["src", "app", "pages", "components", "lib", "tests", "docs"].includes(parts[0]) && /\.(?:ts|tsx|js|jsx|css|md|json)$/.test(path);
+  }, "Only ordinary text source, test, and documentation paths are supported"));
 
 export const fileChangeSchema = z.object({
   path: safePath,
   content: z.string().min(1).max(32_000).refine(value => !/[\u0000-\u0008\u000e-\u001f]/.test(value), "Binary/control data is not supported")
     .refine(value => !/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|(?:ghp_|gho_|github_pat_)[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}/.test(value), "Credential-like content is not supported"),
-  reason: z.string().min(5).max(500),
+  reason: z.string().trim().min(5).max(500),
 }).strict();
 
 export const proposalSchema = z.object({
-  task: z.string().min(5).max(300),
-  summary: z.string().min(10).max(2000),
+  task: z.string().trim().min(5).max(300),
+  summary: z.string().trim().min(10).max(2000),
   files: z.array(fileChangeSchema).min(1).max(5),
-  validationPlan: z.string().min(10).max(1000),
-  risks: z.string().min(5).max(1000),
-  commitMessage: z.string().regex(/^(feat|fix|test|docs|refactor): [^\r\n]{8,70}$/),
+  validationPlan: z.string().trim().min(10).max(1000),
+  risks: z.string().trim().min(5).max(1000),
+  commitMessage: z.string().trim().regex(/^(feat|fix|test|docs|refactor): [^\r\n]{8,70}$/),
 }).strict().superRefine((proposal, ctx) => {
   const paths = proposal.files.map(file => file.path);
   if (new Set(paths).size !== paths.length) ctx.addIssue({ code: "custom", path: ["files"], message: "Duplicate file paths" });

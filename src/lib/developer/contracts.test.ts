@@ -12,7 +12,20 @@ describe("Developer proposal boundaries", () => {
     expect(safeTarget("dev")).toBe("dev");
   });
 
-  it.each([".env", "src/.env", "src/../.env", "src/logo.png", "src/app/.github/workflows/a.yml", "/src/app/a.ts", "src\\app\\a.ts"]) ("rejects dangerous path %s", path => {
+  it("normalizes only harmless outer whitespace and one leading ./ in paths", () => {
+    const parsed = proposalSchema.parse({ ...valid, task: `  ${valid.task}  `, validationPlan: `  ${valid.validationPlan}  `, risks: `  ${valid.risks}  `, commitMessage: `  ${valid.commitMessage}  `, files: [{ ...valid.files[0], path: "  ./src/app/tasks/route.ts  " }] });
+    expect(parsed.files[0].path).toBe("src/app/tasks/route.ts");
+    expect(parsed.commitMessage).toBe(valid.commitMessage);
+    expect(parsed.validationPlan).toBe(valid.validationPlan);
+    expect(parsed.risks).toBe(valid.risks);
+    expect(parsed.files[0].content).toBe(valid.files[0].content);
+  });
+
+  it("rejects paths that collide after safe normalization", () => {
+    expect(proposalSchema.safeParse({ ...valid, files: [valid.files[0], { ...valid.files[0], path: ` ./` + valid.files[0].path }] }).success).toBe(false);
+  });
+
+  it.each([".env", "./.env", "src/.env", "./src/.env", "src/../.env", "./src/../docs/a.md", "././src/app/a.ts", "src/logo.png", "src/app/.github/workflows/a.yml", "/src/app/a.ts", "src\\app\\a.ts", "  ../src/app/a.ts  "]) ("rejects dangerous path %s", path => {
     expect(proposalSchema.safeParse({ ...valid, files: [{ ...valid.files[0], path }] }).success).toBe(false);
   });
 
