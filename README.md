@@ -25,6 +25,8 @@ GitHub login requires `AUTH_GITHUB_ID` and `AUTH_GITHUB_SECRET` from a GitHub OA
 
 To let the Developer Agent work on a linked repository, configure a live AI provider, a GitHub OAuth login with `repo` access, and at least one GitHub CI check. Run the existing workflow to create tasks, then open **Project → Approval Center** and select a task. Review the exact proposed files and risks before approving implementation. Forge opens a real feature branch, commit, and PR; after CI passes, approve the separate merge request if you want Forge to merge. Forge never executes model-generated shell commands. See [Developer execution](docs/agents.md#developer-repository-execution) for limits, recovery, and the manual test.
 
+Developer proposals request a separate completion budget of `8192` tokens by default. Set `DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS` between `1024` and `32768` to fit your model's output and context limits. The model must return complete proposed file contents; a truncated response is rejected with a specific error and never creates a GitHub change. See [Developer execution](docs/agents.md#developer-repository-execution) for troubleshooting.
+
 ## Validation and deployment
 
 Run `npm run lint`, `npm run typecheck`, `npm test`, and `npm run build`. Playwright demo tests (`npm run test:e2e`) require a migrated local database and Chromium (`npx playwright install chromium`); anonymous protection checks (`npm run test:e2e:auth`) need a browser but no database queries. To use an installed Chrome instead of Playwright's Chromium, set `PLAYWRIGHT_BROWSER_CHANNEL=chrome`. GitHub Actions runs lint, typecheck, unit tests, and the production build. See [security](docs/security.md), [deployment](docs/deployment.md), and [roadmap](docs/roadmap.md).

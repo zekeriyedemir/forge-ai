@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@/lib/env", () => ({ serverEnv: () => ({ OPENAI_API_KEY: "test-only", OPENAI_MODEL: "test-model", OPENAI_BASE_URL: "https://example.test/v1" }) }));
+vi.mock("@/lib/env", () => ({ serverEnv: () => ({ OPENAI_API_KEY: "test-only", OPENAI_MODEL: "test-model", OPENAI_BASE_URL: "https://example.test/v1", DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS: 8192 }) }));
 import { generateDeveloperProposal } from "./proposal";
 import { DeveloperProposalError } from "./diagnostics";
 import { proposalSchema } from "./contracts";
@@ -18,10 +18,19 @@ describe("Developer structured output", () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body.messages[1].content).toContain("Improve home page");
     expect(body.messages[1].content).not.toContain("ghp_");
+    expect(body.max_completion_tokens).toBe(8192);
+    expect(body.max_tokens).toBeUndefined();
     const system = body.messages[0].content as string;
     for (const required of ["files[*].path", "validationPlan: ONE JSON string", "risks: ONE JSON string", "commitMessage: ONE JSON string", "COMPLETE final text", "64000 characters"]) expect(system).toContain(required);
     const example = system.split("Valid complete example: ")[1].split("\n")[0];
     expect(proposalSchema.safeParse(JSON.parse(example)).success).toBe(true);
+  });
+
+  it("accepts a complete text-part content response from an OpenAI-compatible provider", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: "stop", message: { content: [{ type: "text", text: JSON.stringify(proposal) }] } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await generateDeveloperProposal("Improve home page", context)).toEqual(proposal);
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -77,6 +86,72 @@ describe("Developer structured output", () => {
     vi.stubGlobal("fetch", fetchMock);
     await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ stage: "structured-output", code: "MALFORMED_JSON" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([null, "", "   ", undefined])('classifies empty provider content %s separately from truncation', async content => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: "stop", message: { content } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ stage: "structured-output", code: "EMPTY_CONTENT" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("classifies a missing message as empty content when the provider reports a normal stop", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: "stop" }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ code: "EMPTY_CONTENT" });
+  });
+
+  it("discards a truncated response and retries with a minimal complete-change instruction", async () => {
+    const truncated = "partial sensitive file content";
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: "length", message: { content: truncated } }] }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(proposal) } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await generateDeveloperProposal("Improve home page", context)).toEqual(proposal);
+    const retry = JSON.parse(fetchMock.mock.calls[1][1].body);
+    expect(retry.messages.at(-1).content).toContain("Discard it completely");
+    expect(retry.messages.at(-1).content).toContain("smallest complete implementation");
+    expect(JSON.stringify(retry)).not.toContain(truncated);
+    expect(JSON.stringify(retry)).not.toContain("Invalid fields:");
+  });
+
+  it("reports repeated truncation even when the provider returns partial JSON or native metadata", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: "stop", native_finish_reason: "max_tokens", message: { content: JSON.stringify(proposal) } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ stage: "structured-output", code: "TRUNCATED" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("recognizes an empty response that exhausted the configured completion budget", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ usage: { completion_tokens: 8192 }, choices: [{ finish_reason: "stop", message: { content: null } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ code: "TRUNCATED" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { ...proposal, files: [{ ...proposal.files[0], content: "x".repeat(32_001) }] },
+    { ...proposal, files: Array.from({ length: 6 }, (_, index) => ({ ...proposal.files[0], path: `src/app/page${index}.tsx` })) },
+    { ...proposal, files: ["a", "b", "c"].map((name) => ({ ...proposal.files[0], path: `src/app/${name}.tsx`, content: "x".repeat(25_000) })) },
+  ])("rejects proposals exceeding Forge's per-file, file-count, or total-size limits", async oversized => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(oversized) } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ stage: "structured-output", code: "INVALID_SCHEMA" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("classifies context-limit and embedded provider errors without exposing response text", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({ error: { code: "context_length_exceeded", message: "sensitive request body" } }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ stage: "ai-provider", code: "CONTEXT_TOO_LARGE" });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const embedded = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ error: { message: "sensitive provider error" } }) });
+    vi.stubGlobal("fetch", embedded);
+    try { await generateDeveloperProposal("Improve home page", context); throw new Error("Expected rejection"); }
+    catch (error) {
+      expect(error).toMatchObject({ stage: "ai-provider", code: "PROVIDER_ERROR" });
+      expect((error as Error).message).not.toContain("sensitive provider error");
+    }
   });
 
   it("rejects replacements for existing files the model did not inspect", async () => {
