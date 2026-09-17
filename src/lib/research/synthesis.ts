@@ -5,19 +5,6 @@ import { z } from "zod";
 export class ResearchSynthesisError extends Error {}
 export const RESEARCH_SYNTHESIS_TIMEOUT_MS = 35_000;
 
-function timeoutSource(error: unknown): string {
-  if (!error || typeof error !== "object") return "unknown";
-  const code = "code" in error && typeof error.code === "string" ? error.code : "";
-  const name = "name" in error && typeof error.name === "string" ? error.name : "";
-  return code || name || error.constructor?.name || "unknown";
-}
-
-function stageTiming(stage: string, event: "started" | "completed" | "failed", startedAt: number, error?: unknown) {
-  const details: { stage: string; elapsedMs: number; timeoutSource?: string } = { stage: `${stage}.${event}`, elapsedMs: Math.max(0, Date.now() - startedAt) };
-  if (event === "failed") details.timeoutSource = timeoutSource(error);
-  (event === "failed" ? console.error : console.info)("Forge stage timing", details);
-}
-
 function isTimeoutLike(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
   const code = "code" in error && typeof error.code === "string" ? error.code : "";
@@ -54,12 +41,8 @@ async function synthesizeResearchInternal(goal: string, sources: ResearchEvidenc
     { role: "system", content: SYSTEM },
     { role: "user", content: JSON.stringify({ goal: goal.slice(0, 2000), sources: sources.map((source, sourceIndex) => ({ sourceIndex, title: source.title, url: source.url, excerpt: source.excerpt.slice(0, 6_000) })) }) },
   ];
-  let repairStartedAt = 0;
   for (let attempt = 0; attempt < 2; attempt++) {
-    if (attempt === 1) { repairStartedAt = Date.now(); stageTiming("research.repair", "started", repairStartedAt); }
     let response: Response;
-    const requestStartedAt = Date.now();
-    stageTiming("research.synthesis.request", "started", requestStartedAt);
     try {
       response = await fetch(`${(env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "")}/chat/completions`, {
       method: "POST",
@@ -70,22 +53,16 @@ async function synthesizeResearchInternal(goal: string, sources: ResearchEvidenc
       redirect: "error",
       });
     } catch (error) {
-      stageTiming("research.synthesis.request", "failed", requestStartedAt, error);
       throw new ResearchSynthesisError(isTimeoutLike(error) ? "Research AI request timed out." : "Research AI request failed before receiving a response.");
     }
-    stageTiming("research.synthesis.request", "completed", requestStartedAt);
     if (response.status === 401 || response.status === 403) throw new ResearchSynthesisError("Research AI provider rejected its credentials or model access.");
     if (response.status === 400 || response.status === 422) throw new ResearchSynthesisError("Research AI provider rejected the JSON request, output budget, or context. Check the configured model's capabilities.");
     if (!response.ok) throw new ResearchSynthesisError(`Research AI request failed (${response.status}).`);
     let completion: unknown;
-    const responseReadStartedAt = Date.now();
-    stageTiming("research.synthesis.response-read", "started", responseReadStartedAt);
     try {
       completion = await completionBody(response);
-      stageTiming("research.synthesis.response-read", "completed", responseReadStartedAt);
     }
     catch (error) {
-      stageTiming("research.synthesis.response-read", "failed", responseReadStartedAt, error);
       if (error instanceof ResearchSynthesisError) throw error;
       throw new ResearchSynthesisError(isTimeoutLike(error) ? "Research AI response timed out." : "Research AI response could not be read.");
     }
@@ -102,7 +79,6 @@ async function synthesizeResearchInternal(goal: string, sources: ResearchEvidenc
     try {
       const value = researchAnalysis.parse(JSON.parse(content.trim()));
       const validated = validateEvidence(value, sources);
-      if (attempt === 1) stageTiming("research.repair", "completed", repairStartedAt);
       return validated;
     } catch {
       if (attempt === 1) break;
@@ -113,14 +89,5 @@ async function synthesizeResearchInternal(goal: string, sources: ResearchEvidenc
 }
 
 export async function synthesizeResearch(goal: string, sources: ResearchEvidence[]): Promise<ResearchAnalysis> {
-  const startedAt = Date.now();
-  stageTiming("research.synthesis", "started", startedAt);
-  try {
-    const result = await synthesizeResearchInternal(goal, sources);
-    stageTiming("research.synthesis", "completed", startedAt);
-    return result;
-  } catch (error) {
-    stageTiming("research.synthesis", "failed", startedAt, error);
-    throw error;
-  }
+  return synthesizeResearchInternal(goal, sources);
 }
