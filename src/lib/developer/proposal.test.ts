@@ -1,12 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/lib/env", () => ({ serverEnv: () => ({ OPENAI_API_KEY: "test-only", OPENAI_MODEL: "test-model", OPENAI_BASE_URL: "https://example.test/v1", DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS: 8192 }) }));
-import { generateDeveloperProposal } from "./proposal";
+import { generateCiFixProposal, generateDeveloperProposal } from "./proposal";
 import { DeveloperProposalError } from "./diagnostics";
 import { proposalSchema } from "./contracts";
 
 const context = { paths: ["src/app/page.tsx"], files: [{ path: "src/app/page.tsx", content: "export default function Page() { return null; }" }] };
-const proposal = { task: "Improve home page", summary: "Render a useful welcome message on the home page.", files: [{ path: "src/app/page.tsx", content: "export default function Page() { return <main>Welcome</main>; }", reason: "Display a welcome message" }], validationPlan: "Run the app checks and review CI on GitHub.", risks: "The visual layout might require a manual review.", commitMessage: "feat: improve home page welcome" };
+const proposal = { task: "Improve home page", summary: "Render a useful welcome message on the home page.", files: [{ path: "src/app/page.tsx", operation: "UPDATE", content: "export default function Page() { return <main>Welcome</main>; }", reason: "Display a welcome message" }], validationPlan: "Run the app checks and review CI on GitHub.", validationExpectation: "The home page renders and GitHub CI checks pass.", risks: "The visual layout might require a manual review.", commitMessage: "feat: improve home page welcome" };
 
 beforeEach(() => vi.unstubAllGlobals());
 
@@ -268,5 +268,41 @@ describe("Developer structured output", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status, text }));
     await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ stage: "ai-provider", code });
     expect(text).not.toHaveBeenCalled();
+  });
+});
+
+describe("CI fix structured output", () => {
+  const failure = { summary: "The build failed during typecheck.", diagnostics: ["TypeScript TS2322", "File src/app/page.tsx"] };
+  const fix = { ...proposal, failureSummary: "The build failed during typecheck on the page.", likelyCause: "The page returned an incompatible component type.", commitMessage: "fix: correct home page component type" };
+
+  it("requests a complete correction contract with only sanitized CI facts", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: JSON.stringify(fix) } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await generateCiFixProposal("Fix home page", context, failure)).toEqual(fix);
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.messages[0].content).toContain("failureSummary, likelyCause");
+    expect(body.messages[1].content).toContain("TypeScript TS2322");
+    expect(body.messages[1].content).not.toContain("ghp_");
+  });
+
+  it("makes one bounded repair attempt for an invalid fix, then rejects malformed output", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: JSON.stringify({ ...fix, likelyCause: [] }) } }] }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "not JSON" } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateCiFixProposal("Fix home page", context, failure)).rejects.toMatchObject({ stage: "structured-output", code: "MALFORMED_JSON" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const repair = JSON.parse(fetchMock.mock.calls[1][1].body);
+    expect(repair.messages.at(-1).content).toContain("likelyCause");
+  });
+
+  it("never echoes credential-like model fields in a repair prompt", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: JSON.stringify({ ...fix, summary: "DATABASE_URL=postgres://user:private@host/db", likelyCause: [] }) } }] }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: JSON.stringify(fix) } }] }) });
+    vi.stubGlobal("fetch", fetchMock);
+    await generateCiFixProposal("Fix home page", context, failure);
+    const repair = JSON.parse(fetchMock.mock.calls[1][1].body);
+    expect(repair.messages.at(-1).content).not.toContain("postgres://user:private");
   });
 });

@@ -5,8 +5,8 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { authenticatedUserId, projectForOwner } from "@/lib/access";
 import { db } from "@/lib/db";
-import { DeveloperFlowError, createDeveloperProposal, decideApproval, executeImplementation, executeMerge, retryApproval } from "@/lib/developer/runtime";
-import { DeveloperProposalError } from "@/lib/developer/diagnostics";
+import { DeveloperFlowError, createCiCorrection, createDeveloperProposal, decideApproval, executeCiCorrection, executeImplementation, executeMerge, observeDeveloperCi, retryApproval } from "@/lib/developer/runtime";
+import { DeveloperProposalError, RepositoryValidationError } from "@/lib/developer/diagnostics";
 import { DeveloperGitHubError } from "@/lib/developer/github";
 import { AiProviderError } from "@/lib/agents/provider";
 
@@ -26,7 +26,7 @@ function destination(projectId: string, error?: string) {
 
 function message(error: unknown) {
   if (error instanceof DeveloperProposalError) return error.publicMessage;
-  if (error instanceof DeveloperFlowError || error instanceof AiProviderError || error instanceof DeveloperGitHubError) return error.message;
+  if (error instanceof DeveloperFlowError || error instanceof AiProviderError || error instanceof DeveloperGitHubError || error instanceof RepositoryValidationError) return error.message;
   return "Operation failed. Review the project activity and retry.";
 }
 
@@ -48,6 +48,7 @@ export async function decideDevelopment(projectId: string, approvalId: string, f
     const action = await decideApproval(projectId, approvalId, userId, decision);
     if (decision === "approve") {
       if (action === "IMPLEMENT") await executeImplementation(projectId, approvalId, userId);
+      else if (action === "FIX") await executeCiCorrection(projectId, approvalId, userId);
       else await executeMerge(projectId, approvalId, userId);
     }
   } catch (cause) { error = message(cause); }
@@ -63,7 +64,26 @@ export async function retryDevelopment(projectId: string, approvalId: string) {
     if (!approval) throw new Error("Approval not found.");
     await retryApproval(projectId, approvalId, userId);
     if (approval.action === "IMPLEMENT") await executeImplementation(projectId, approvalId, userId);
+    else if (approval.action === "FIX") await executeCiCorrection(projectId, approvalId, userId);
     else await executeMerge(projectId, approvalId, userId);
   } catch (cause) { error = message(cause); }
+  destination(projectId, error);
+}
+
+export async function observeDevelopmentCi(projectId: string, executionId: string) {
+  const userId = await identity(projectId);
+  z.uuid().parse(executionId);
+  let error: string | undefined;
+  try { await observeDeveloperCi(projectId, executionId, userId); }
+  catch (cause) { error = message(cause); }
+  destination(projectId, error);
+}
+
+export async function proposeDevelopmentCorrection(projectId: string, executionId: string) {
+  const userId = await identity(projectId);
+  z.uuid().parse(executionId);
+  let error: string | undefined;
+  try { await createCiCorrection(projectId, executionId, userId); }
+  catch (cause) { error = message(cause); }
   destination(projectId, error);
 }

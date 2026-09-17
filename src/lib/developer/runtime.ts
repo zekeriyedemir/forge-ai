@@ -2,12 +2,13 @@ import { Prisma } from "@prisma/client";
 import { ZodError } from "zod";
 import { db } from "@/lib/db";
 import { projectForOwner } from "@/lib/access";
-import { proposalSchema, featureBranch, safeTarget, shaSchema } from "./contracts";
+import { ciFixSchema, generatedProposalSchema, proposalSchema, featureBranch, safeTarget, shaSchema, type DeveloperProposal } from "./contracts";
 import { DeveloperGitHubError, developerGitHub, type DeveloperGitHub } from "./github";
-import { generateDeveloperProposal } from "./proposal";
+import { generateCiFixProposal, generateDeveloperProposal } from "./proposal";
 import { DeveloperProposalError, RepositoryValidationError, schemaFields, type ProposalFailureStage } from "./diagnostics";
 
 export class DeveloperFlowError extends Error {}
+const MAX_CORRECTIONS = 3;
 const staleExecutionBefore = () => new Date(Date.now() - 15 * 60_000);
 
 async function proposalStep<T>(stage: ProposalFailureStage, code: string, fallback: string, work: () => Promise<T>): Promise<T> {
@@ -47,6 +48,17 @@ async function verifiedGitHub(projectId: string, userId: string, repositoryId?: 
   return { linked, github, remote };
 }
 
+function validateOperations(proposal: DeveloperProposal, context: { paths: string[]; files: { path: string; content: string }[] }) {
+  const readable = new Map(context.files.map(file => [file.path, file.content]));
+  const existing = new Set(context.paths);
+  for (const file of proposal.files) {
+    if (existing.has(file.path)) {
+      if (file.operation === "CREATE") throw new DeveloperFlowError("CREATE cannot replace an existing repository file.");
+      if (!readable.has(file.path) || readable.get(file.path) === file.content) throw new DeveloperFlowError("The proposal tried to replace an unread or unchanged repository file.");
+    } else if (file.operation === "UPDATE") throw new DeveloperFlowError("UPDATE requires an existing inspected repository file.");
+  }
+}
+
 export async function createDeveloperProposal(projectId: string, taskId: string, userId: string, client?: DeveloperGitHub, generator = generateDeveloperProposal) {
   await owner(projectId, userId);
   try {
@@ -63,18 +75,17 @@ export async function createDeveloperProposal(projectId: string, taskId: string,
     });
     const context = await proposalStep("github-inspection", "INSPECTION_FAILED", "Could not read the repository tree or source context.", () => github.context(linked.fullName, baseSha, `${task.title} ${task.description}`));
     const generated = await proposalStep("ai-provider", "PROVIDER_FAILED", "The AI provider could not generate a proposal.", () => generator(`${task.title}\n${task.description}`, context));
-    const parsed = proposalSchema.safeParse(generated);
+    const parsed = generatedProposalSchema.safeParse(generated);
     if (!parsed.success) throw new DeveloperProposalError("proposal-validation", "INVALID_PROPOSAL", `The proposal failed validation (${schemaFields(parsed.error)}).`);
     const proposal = parsed.data;
-    const readable = new Map(context.files.map(file => [file.path, file.content]));
-    const existingPaths = new Set(context.paths);
-    if (proposal.files.some(file => existingPaths.has(file.path) && (!readable.has(file.path) || readable.get(file.path) === file.content))) throw new DeveloperProposalError("repository-validation", "UNINSPECTED_OR_UNCHANGED_FILE", "The proposal tried to replace an unread or unchanged repository file.");
+    try { validateOperations(proposal, context); }
+    catch { throw new DeveloperProposalError("repository-validation", "INVALID_FILE_OPERATION", "A proposed CREATE or UPDATE did not match inspected repository contents."); }
     const id = crypto.randomUUID();
     const branch = featureBranch(task.title, id);
     try {
       return await db.$transaction(async tx => {
-        const execution = await tx.developerExecution.create({ data: { id, projectId, taskId, runId: task.sourceRunId, repositoryId: linked.id, repositoryGithubId: linked.githubId, repositoryFullName: linked.fullName, branch, targetBranch: target, baseSha, proposal: proposal as Prisma.InputJsonValue, validationSummary: "Static path, size, and structured-output validation passed. Repository tests and CI have not run." } });
-        await tx.approvalRequest.create({ data: { projectId, executionId: id, runId: task.sourceRunId, action: "IMPLEMENT", requestedById: userId, description: `Implement ${proposal.task} in ${linked.fullName} on ${branch}`, payload: { branch, target, baseSha, files: proposal.files.map(file => ({ path: file.path, reason: file.reason })), summary: proposal.summary, risks: proposal.risks, validationPlan: proposal.validationPlan } } });
+        const execution = await tx.developerExecution.create({ data: { id, projectId, taskId, runId: task.sourceRunId, repositoryId: linked.id, repositoryGithubId: linked.githubId, repositoryFullName: linked.fullName, branch, targetBranch: target, baseSha, proposal: proposal as Prisma.InputJsonValue, inspectedPaths: context.files.map(file => file.path), validationSummary: "Static path, size, and structured-output validation passed. Repository tests and CI have not run." } });
+        await tx.approvalRequest.create({ data: { projectId, executionId: id, runId: task.sourceRunId, action: "IMPLEMENT", requestedById: userId, description: `Implement ${proposal.task} in ${linked.fullName} on ${branch}`, payload: { branch, target, baseSha, files: proposal.files.map(file => ({ path: file.path, operation: file.operation, reason: file.reason })), summary: proposal.summary, risks: proposal.risks, validationPlan: proposal.validationPlan, validationExpectation: proposal.validationExpectation } } });
         await tx.activityEvent.create({ data: { projectId, kind: "developer", message: `Developer proposal awaiting approval: ${proposal.task}` } });
         return execution;
       });
@@ -97,7 +108,7 @@ export async function decideApproval(projectId: string, approvalId: string, user
   const approval = await db.approvalRequest.findFirst({ where: { id: approvalId, projectId }, include: { execution: true } });
   if (!approval) throw new DeveloperFlowError("Approval not found in this project.");
   if (approval.status !== "PENDING") throw new DeveloperFlowError("This approval has already been decided.");
-  if (approval.action === "MERGE") {
+  if (approval.action === "MERGE" || approval.action === "FIX") {
     const pull = approval.execution;
     if (pull.status !== "PR_OPEN" || !pull.commitSha || !pull.pullNumber) throw new DeveloperFlowError("The implementation is not ready for merge approval.");
   }
@@ -107,7 +118,7 @@ export async function decideApproval(projectId: string, approvalId: string, user
   return approval.action;
 }
 
-async function claimApproval(projectId: string, approvalId: string, action: "IMPLEMENT" | "MERGE") {
+async function claimApproval(projectId: string, approvalId: string, action: "IMPLEMENT" | "FIX" | "MERGE") {
   const approval = await db.approvalRequest.findFirst({ where: { id: approvalId, projectId, action } });
   if (!approval) throw new DeveloperFlowError("Approval not found.");
   if (approval.status === "EXECUTED") return false;
@@ -159,7 +170,7 @@ export async function executeImplementation(projectId: string, approvalId: strin
     if (pull.state !== "open" || pull.head.sha !== commitSha || pull.base.repo.id !== Number(linked.githubId)) throw new DeveloperFlowError("GitHub returned a pull request that does not match the approved commit.");
     await db.$transaction(async tx => {
       await tx.developerExecution.update({ where: { id: execution.id }, data: { status: "PR_OPEN", pullNumber: pull.number, pullUrl: pull.html_url, pullState: pull.state, validationSummary: "Static proposal checks passed; remote CI must pass before merge.", error: null, completedAt: new Date() } });
-      await tx.approvalRequest.upsert({ where: { executionId_action: { executionId: execution.id, action: "MERGE" } }, create: { projectId, executionId: execution.id, runId: execution.runId, action: "MERGE", requestedById: userId, description: `Merge PR #${pull.number} into ${execution.targetBranch}`, payload: { repositoryId: linked.id, branch: execution.branch, target: execution.targetBranch, pullNumber: pull.number, headSha: commitSha } }, update: {} });
+      await tx.approvalRequest.upsert({ where: { executionId_action_round: { executionId: execution.id, action: "MERGE", round: 0 } }, create: { projectId, executionId: execution.id, runId: execution.runId, action: "MERGE", requestedById: userId, description: `Merge PR #${pull.number} into ${execution.targetBranch}`, payload: { repositoryId: linked.id, branch: execution.branch, target: execution.targetBranch, pullNumber: pull.number, headSha: commitSha } }, update: {} });
     });
     await finishApproval(projectId, approvalId, "IMPLEMENT");
     return await db.developerExecution.findUniqueOrThrow({ where: { id: execution.id } });
@@ -167,6 +178,112 @@ export async function executeImplementation(projectId: string, approvalId: strin
     const message = safeError(error);
     await db.approvalRequest.update({ where: { id: approvalId }, data: { status: "FAILED", error: message } });
     await db.developerExecution.update({ where: { id: execution.id }, data: { status: "FAILED", error: message } });
+    throw new DeveloperFlowError(message);
+  }
+}
+
+async function openPullForExecution(execution: { branch: string; targetBranch: string; commitSha: string | null; pullNumber: number | null }, linked: { fullName: string; githubId: bigint }, github: DeveloperGitHub) {
+  if (!execution.pullNumber || !execution.commitSha) throw new DeveloperFlowError("The pull request or commit is missing.");
+  const head = await github.ref(linked.fullName, execution.branch);
+  const pull = await github.pull(linked.fullName, execution.pullNumber);
+  if (head !== execution.commitSha || pull.state !== "open" || pull.head.sha !== execution.commitSha || pull.head.ref !== execution.branch || pull.base.ref !== execution.targetBranch || pull.head.repo.id !== Number(linked.githubId) || pull.base.repo.id !== Number(linked.githubId)) throw new DeveloperFlowError("The pull request or feature branch changed outside Forge. Refresh and review GitHub.");
+  return pull;
+}
+
+export async function observeDeveloperCi(projectId: string, executionId: string, userId: string, client?: DeveloperGitHub) {
+  await owner(projectId, userId);
+  const execution = await db.developerExecution.findFirst({ where: { id: executionId, projectId } });
+  if (!execution || execution.status !== "PR_OPEN" || !execution.commitSha) throw new DeveloperFlowError("An open Forge pull request is required to inspect CI.");
+  const headSha = execution.commitSha;
+  const { linked, github } = await verifiedGitHub(projectId, userId, execution.repositoryId, client, execution.repositoryGithubId, execution.repositoryFullName);
+  await openPullForExecution(execution, linked, github);
+  const snapshot = await github.ciSnapshot(linked.fullName, shaSchema.parse(headSha));
+  const updated = await db.developerExecution.updateMany({ where: { id: execution.id, projectId, status: "PR_OPEN", commitSha: headSha }, data: { ciStatus: snapshot.state, ciSummary: snapshot.summary, ciChecks: snapshot.checks as Prisma.InputJsonValue } });
+  if (updated.count !== 1) throw new DeveloperFlowError("The PR head changed during CI refresh. Refresh again for the current head.");
+  return snapshot;
+}
+
+export async function createCiCorrection(projectId: string, executionId: string, userId: string, client?: DeveloperGitHub, generator = generateCiFixProposal) {
+  await owner(projectId, userId);
+  const execution = await db.developerExecution.findFirst({ where: { id: executionId, projectId }, include: { task: true } });
+  if (!execution || execution.status !== "PR_OPEN" || !execution.commitSha) throw new DeveloperFlowError("An open Forge pull request is required for a CI correction.");
+  const headSha = execution.commitSha;
+  const attempts = await db.approvalRequest.count({ where: { executionId, action: "FIX" } });
+  if (attempts >= MAX_CORRECTIONS || execution.correctionCount >= MAX_CORRECTIONS) throw new DeveloperFlowError("The three-correction limit was reached. Review the PR manually.");
+  const active = await db.approvalRequest.findFirst({ where: { executionId, action: "FIX", status: { in: ["PENDING", "APPROVED", "EXECUTING"] } } });
+  if (active) return active;
+  const { linked, github } = await verifiedGitHub(projectId, userId, execution.repositoryId, client, execution.repositoryGithubId, execution.repositoryFullName);
+  await openPullForExecution(execution, linked, github);
+  const ci = await github.ciSnapshot(linked.fullName, headSha);
+  const updated = await db.developerExecution.updateMany({ where: { id: executionId, projectId, status: "PR_OPEN", commitSha: headSha }, data: { ciStatus: ci.state, ciSummary: ci.summary, ciChecks: ci.checks as Prisma.InputJsonValue } });
+  if (updated.count !== 1) throw new DeveloperFlowError("The PR head changed during CI analysis. Refresh again for the current head.");
+  if (ci.state !== "FAILURE") throw new DeveloperFlowError("GitHub CI must report a failure on the current PR head before a correction can be proposed.");
+  const failure = await github.ciFailure(linked.fullName, headSha);
+  if (failure.job === "unavailable" && failure.diagnostics.length === 0) throw new DeveloperFlowError("Failed GitHub Actions job details are unavailable for this commit. Review the failing check on GitHub; no correction proposal was created.");
+  const original = proposalSchema.safeParse(execution.proposal);
+  const taskTitle = execution.task?.title ?? (original.success ? original.data.task : "Correct the Developer implementation");
+  const task = `${taskTitle}\n${execution.task?.description ?? ""}`;
+  const context = await github.context(linked.fullName, headSha, `${task} ${failure.summary} ${failure.diagnostics.join(" ")}`);
+  const generated = await generator(task, context, { summary: failure.summary, diagnostics: failure.diagnostics });
+  const parsed = ciFixSchema.safeParse(generated);
+  if (!parsed.success) throw new DeveloperFlowError(`The AI correction failed structured validation (${schemaFields(parsed.error)}). No GitHub changes were made.`);
+  try { validateOperations(parsed.data, context); }
+  catch { throw new DeveloperFlowError("The correction targets an unread, unchanged, or incorrectly classified file. No GitHub changes were made."); }
+  const round = attempts + 1;
+  try {
+    return await db.$transaction(async tx => {
+      const current = await tx.developerExecution.findUniqueOrThrow({ where: { id: executionId } });
+      if (current.commitSha !== headSha || current.status !== "PR_OPEN") throw new DeveloperFlowError("The PR head changed while preparing the correction.");
+      const approval = await tx.approvalRequest.create({ data: { projectId, executionId, runId: execution.runId, action: "FIX", round, requestedById: userId, description: `Correct failed CI for PR #${execution.pullNumber}, round ${round}`, baseSha: headSha, failureSummary: failure.summary, payload: { proposal: parsed.data, inspectedPaths: context.files.map(file => file.path), job: failure.job, step: failure.step, diagnostics: failure.diagnostics } as Prisma.InputJsonValue } });
+      await tx.activityEvent.create({ data: { projectId, kind: "developer", message: `CI correction round ${round} awaits approval for PR #${execution.pullNumber}` } });
+      return approval;
+    });
+  } catch (error) {
+    if (error instanceof DeveloperFlowError) throw error;
+    throw new DeveloperFlowError("Could not save the CI correction approval. No GitHub changes were made.");
+  }
+}
+
+export async function executeCiCorrection(projectId: string, approvalId: string, userId: string, client?: DeveloperGitHub) {
+  await owner(projectId, userId);
+  const approval = await db.approvalRequest.findFirst({ where: { id: approvalId, projectId, action: "FIX" }, include: { execution: true } });
+  if (!approval) throw new DeveloperFlowError("CI correction approval not found.");
+  if (!await claimApproval(projectId, approvalId, "FIX")) return approval.execution;
+  const execution = approval.execution;
+  try {
+    if (execution.status !== "PR_OPEN" || !execution.commitSha || !approval.baseSha || approval.baseSha !== execution.commitSha || execution.correctionCount >= MAX_CORRECTIONS || approval.round > MAX_CORRECTIONS) throw new DeveloperFlowError("The approved correction is stale or the correction limit was reached.");
+    const payload = approval.payload as { proposal?: unknown; inspectedPaths?: unknown };
+    const proposal = ciFixSchema.parse(payload.proposal);
+    const inspectedPaths = Array.isArray(payload.inspectedPaths) ? payload.inspectedPaths : [];
+    if (proposal.files.some(file => file.operation === "UPDATE" && !inspectedPaths.includes(file.path))) throw new DeveloperFlowError("The approved correction includes a file Forge did not inspect.");
+    const { linked, github } = await verifiedGitHub(projectId, userId, execution.repositoryId, client, execution.repositoryGithubId, execution.repositoryFullName);
+    let head = await github.ref(linked.fullName, execution.branch);
+    const pull = await github.pull(linked.fullName, execution.pullNumber!);
+    if (pull.state !== "open" || pull.number !== execution.pullNumber || pull.head.ref !== execution.branch || pull.base.ref !== execution.targetBranch || pull.head.repo.id !== Number(linked.githubId) || pull.base.repo.id !== Number(linked.githubId)) throw new DeveloperFlowError("The PR changed after correction approval. No correction was pushed.");
+    if (head !== approval.baseSha && head !== approval.resultSha) throw new DeveloperFlowError("The feature branch changed after correction approval. No correction was pushed.");
+    if (head === approval.baseSha && pull.head.sha !== approval.baseSha) throw new DeveloperFlowError("The PR head changed after correction approval. No correction was pushed.");
+    let resultSha = approval.resultSha;
+    if (head === approval.baseSha) {
+      if (!resultSha) {
+        resultSha = await github.createCommit(linked.fullName, approval.baseSha, proposal);
+        await db.approvalRequest.update({ where: { id: approvalId }, data: { resultSha } });
+      }
+      await github.updateBranch(linked.fullName, execution.branch, resultSha);
+      head = resultSha;
+    }
+    if (!resultSha || head !== resultSha) throw new DeveloperFlowError("The correction commit could not be verified.");
+    const updatedPull = await github.pull(linked.fullName, execution.pullNumber!);
+    if (updatedPull.state !== "open" || updatedPull.head.sha !== resultSha || updatedPull.head.ref !== execution.branch || updatedPull.base.ref !== execution.targetBranch || updatedPull.head.repo.id !== Number(linked.githubId) || updatedPull.base.repo.id !== Number(linked.githubId)) throw new DeveloperFlowError("GitHub has not confirmed the corrected PR head. Retry after it updates; do not create another commit.");
+    return await db.$transaction(async tx => {
+      const updated = await tx.developerExecution.update({ where: { id: execution.id }, data: { commitSha: resultSha, correctionCount: approval.round, ciStatus: "PENDING", ciSummary: "Waiting for CI on the corrected PR head.", ciChecks: Prisma.JsonNull, validationSummary: "Correction committed; remote CI must pass before merge.", error: null } });
+      await tx.approvalRequest.upsert({ where: { executionId_action_round: { executionId: execution.id, action: "MERGE", round: approval.round } }, create: { projectId, executionId: execution.id, runId: execution.runId, action: "MERGE", round: approval.round, requestedById: userId, description: `Merge corrected PR #${execution.pullNumber} into ${execution.targetBranch}`, payload: { repositoryId: linked.id, branch: execution.branch, target: execution.targetBranch, pullNumber: execution.pullNumber, headSha: resultSha } }, update: {} });
+      await tx.approvalRequest.update({ where: { id: approvalId }, data: { status: "EXECUTED", executedAt: new Date(), error: null } });
+      await tx.activityEvent.create({ data: { projectId, kind: "developer", message: "Approved CI correction updated the pull request" } });
+      return updated;
+    });
+  } catch (error) {
+    const message = safeError(error);
+    await db.approvalRequest.update({ where: { id: approvalId }, data: { status: "FAILED", error: message } });
     throw new DeveloperFlowError(message);
   }
 }
