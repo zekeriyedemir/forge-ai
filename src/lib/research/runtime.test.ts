@@ -1,12 +1,29 @@
 import { describe, expect, it, vi } from "vitest";
 import { researchQueries, validateEvidence } from "./contracts";
-import { collectResearch, researchReport } from "./runtime";
+import { collectResearch, researchReport, sanitizeResearchError } from "./runtime";
 import type { ResearchProvider } from "./provider";
 
 const excerpt = "A published survey describes how small teams struggle to manage customer requests and need faster response times.";
 const analysis = { summary: "The retrieved page suggests a customer support workflow problem.", limitations: "One page is insufficient to estimate overall market demand.", findings: [{ area: "CUSTOMER_PAIN" as const, claim: "Small teams report difficulty managing customer requests.", sourceIndex: 0, quote: "small teams struggle to manage customer requests", confidence: "LOW" as const, limitation: "This is one source and its sample is not representative." }] };
 
 describe("bounded evidence-backed research", () => {
+  it("sanitizes nested errors without exposing URLs, credentials, or bodies", () => {
+    const cause = Object.assign(new Error("socket reset https://example.org/private?token=secret"), { code: "ECONNRESET" });
+    const error = Object.assign(new TypeError("request failed https://example.org/?api_key=secret response body hidden"), { code: "ERR_NETWORK", cause });
+    expect(sanitizeResearchError(error)).toEqual({ constructorName: "TypeError", name: "TypeError", code: "ERR_NETWORK", message: "request failed [url redacted] response body hidden", causeName: "Error", causeCode: "ECONNRESET", causeMessage: "socket reset [url redacted]" });
+  });
+
+  it("logs only a hostname and sanitized retrieval error fields", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const failure = Object.assign(new TypeError("request failed https://example.org/?token=secret"), { cause: Object.assign(new Error("socket hang up"), { code: "ECONNRESET" }) });
+    const provider: ResearchProvider = { name: "fake-search", search: vi.fn(async () => [{ title: "Survey", url: "https://example.org/article?token=secret", snippet: "Snippet" }]), retrieve: vi.fn(async () => { throw failure; }) };
+    await expect(collectResearch("Build a customer support product", provider, async () => analysis)).rejects.toThrow("connection reset (ECONNRESET)");
+    expect(log).toHaveBeenCalledOnce();
+    expect(log.mock.calls[0][1]).toEqual({ hostname: "example.org", error: sanitizeResearchError(failure) });
+    expect(JSON.stringify(log.mock.calls[0])).not.toContain("secret");
+    log.mockRestore();
+  });
+
   it("uses five bounded queries, deduplicates pages, and produces cited report text", async () => {
     const provider: ResearchProvider = { name: "fake-search", search: vi.fn(async () => [{ title: "Survey", url: "https://example.org/survey", snippet: "Snippet" }]), retrieve: vi.fn(async url => ({ url, title: "Survey", excerpt, retrievedAt: new Date("2026-09-17T12:00:00Z") })) };
     const analyze = vi.fn(async () => analysis);
@@ -53,6 +70,12 @@ describe("bounded evidence-backed research", () => {
     const provider: ResearchProvider = { name: "fake-search", search: vi.fn(async query => [{ title: "Survey", url: `https://example.org/${encodeURIComponent(query)}`, snippet: "Snippet" }]), retrieve: vi.fn(async () => { throw failure; }) };
     await expect(collectResearch("Build a customer support product", provider, async () => analysis)).rejects.toThrow(category);
     await expect(collectResearch("Build a customer support product", provider, async () => analysis)).rejects.not.toThrow("secret");
+  });
+
+  it("classifies a network code nested in AggregateError", async () => {
+    const failure = new AggregateError([Object.assign(new Error("socket reset"), { code: "ECONNRESET" })], "all retrieval attempts failed");
+    const provider: ResearchProvider = { name: "fake-search", search: vi.fn(async query => [{ title: "Survey", url: `https://example.org/${encodeURIComponent(query)}`, snippet: "Snippet" }]), retrieve: vi.fn(async () => { throw failure; }) };
+    await expect(collectResearch("Build a customer support product", provider, async () => analysis)).rejects.toThrow("connection reset (ECONNRESET)");
   });
 
   it.each([
