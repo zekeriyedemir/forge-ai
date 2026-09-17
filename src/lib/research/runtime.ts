@@ -4,6 +4,27 @@ import { synthesizeResearch } from "./synthesis";
 
 export type ResearchResult = { analysis: ResearchAnalysis; sources: ResearchEvidence[]; queryCount: number; provider: string; partialFailures: number };
 
+function retrievalFailureCategory(error: unknown): string {
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  if (message.includes("timed out") || message.includes("timeout")) return "timeout";
+  if (message.includes("not html") || message.includes("unavailable")) return "non-html/unavailable";
+  if (message.includes("public addresses") || message.includes("permitted public")) return "network policy";
+  if (message.includes("redirect")) return "redirect";
+  if (message.includes("readable text")) return "insufficient text";
+  if (message.includes("size limit") || message.includes("exceeded")) return "size limit";
+  return "other";
+}
+
+function retrievalFailureSummary(results: PromiseSettledResult<unknown>[]): string {
+  const counts = new Map<string, number>();
+  for (const result of results) {
+    if (result.status !== "rejected") continue;
+    const category = retrievalFailureCategory(result.reason);
+    counts.set(category, (counts.get(category) ?? 0) + 1);
+  }
+  return [...counts.entries()].map(([category, count]) => `${count} ${category}`).join(", ");
+}
+
 export async function collectResearch(goal: string, search: ResearchProvider, analyze = synthesizeResearch): Promise<ResearchResult> {
   const queries = researchQueries(goal);
   const searches = await Promise.allSettled(queries.map(query => search.search(query)));
@@ -26,7 +47,10 @@ export async function collectResearch(goal: string, search: ResearchProvider, an
   const uniquePages = new Map<string, ResearchEvidence>();
   for (const result of pages) if (result.status === "fulfilled" && !uniquePages.has(result.value.url)) uniquePages.set(result.value.url, result.value);
   const sources = [...uniquePages.values()];
-  if (!sources.length) throw new ResearchProviderError("Research found no retrievable public HTML pages. No findings were created.");
+  if (!sources.length) {
+    const summary = retrievalFailureSummary(pages);
+    throw new ResearchProviderError(`Research found no retrievable public HTML pages. No findings were created.${summary ? ` Retrieval failures: ${summary}.` : ""}`);
+  }
   const analysis = validateEvidence(await analyze(goal, sources), sources);
   return { analysis, sources, queryCount: queries.length, provider: search.name, partialFailures };
 }

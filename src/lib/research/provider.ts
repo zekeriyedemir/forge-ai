@@ -89,6 +89,22 @@ async function boundedBody(response: Response, limit: number): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+export async function boundedHtmlBody(stream: AsyncIterable<Uint8Array>, stop: () => void = () => {}): Promise<string> {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for await (const chunk of stream) {
+    const remaining = MAX_PAGE_BYTES - size;
+    if (remaining <= 0) break;
+    chunks.push(chunk.subarray(0, remaining));
+    size += Math.min(chunk.byteLength, remaining);
+    if (size >= MAX_PAGE_BYTES) {
+      stop();
+      break;
+    }
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function pinnedPage(url: URL, address: string): Promise<{ status: number; contentType: string; location?: string; body: string }> {
   return new Promise((resolve, reject) => {
     const call = request(url, { method: "GET", timeout: 5_000, signal: AbortSignal.timeout(5_000), headers: { Accept: "text/html", "Accept-Encoding": "identity", "User-Agent": "ForgeResearch/1.0" }, lookup: (_hostname, _options, callback) => callback(null, address, 4) }, response => {
@@ -96,12 +112,16 @@ async function pinnedPage(url: URL, address: string): Promise<{ status: number; 
       const contentType = String(response.headers["content-type"] ?? "");
       const location = typeof response.headers.location === "string" ? response.headers.location : undefined;
       if (response.headers["content-encoding"] && response.headers["content-encoding"] !== "identity") { response.destroy(); reject(new ResearchProviderError("Compressed research pages are unsupported.")); return; }
-      if (Number(response.headers["content-length"] ?? 0) > MAX_PAGE_BYTES) { response.destroy(); reject(new ResearchProviderError("Research page exceeded its size limit.")); return; }
-      const chunks: Buffer[] = [];
-      let size = 0;
-      response.on("data", (chunk: Buffer) => { size += chunk.length; if (size > MAX_PAGE_BYTES) { response.destroy(); reject(new ResearchProviderError("Research page exceeded its size limit.")); } else chunks.push(chunk); });
-      response.on("end", () => resolve({ status, contentType, location, body: Buffer.concat(chunks).toString("utf8") }));
-      response.on("error", reject);
+      if (status >= 200 && status < 300 && !/^text\/html(?:;|$)/i.test(contentType)) { response.destroy(); reject(new ResearchProviderError("Research page was unavailable or not HTML.")); return; }
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (error) reject(error);
+        else resolve({ status, contentType, location, body: responseBody });
+      };
+      let responseBody = "";
+      boundedHtmlBody(response, () => { response.pause(); response.destroy(); }).then(body => { responseBody = body; finish(); }).catch(error => finish(error));
     });
     call.on("timeout", () => call.destroy(new ResearchProviderError("Research page request timed out.")));
     call.on("error", reject);

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { braveResearchProvider, extractHtmlText, publicIpv4, publicResearchUrl, researchProviderConfigured, researchProviderFromEnv, retrievePublicPage, searxngResearchProvider } from "./provider";
+import { boundedHtmlBody, braveResearchProvider, extractHtmlText, publicIpv4, publicResearchUrl, researchProviderConfigured, researchProviderFromEnv, retrievePublicPage, searxngResearchProvider } from "./provider";
 import type { lookup } from "node:dns/promises";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -35,6 +35,49 @@ describe("public research network boundary", () => {
   it("normalizes tracking fragments and rejects overlong URLs", () => {
     expect(publicResearchUrl("https://example.org/path?utm_source=ad#part").href).toBe("https://example.org/path");
     expect(() => publicResearchUrl(`https://example.org/${"x".repeat(600)}`)).toThrow("size limit");
+  });
+
+  it("extracts useful text from a page larger than the bounded read budget", async () => {
+    const html = `<html><body><main>${"Useful market evidence. ".repeat(5_000)}</main></body></html>`;
+    const resolve = vi.fn(async () => [{ address: "8.8.8.8", family: 4 }]) as unknown as typeof lookup;
+    const fetchPage = vi.fn(async () => ({ status: 200, contentType: "text/html; charset=utf-8", body: html }));
+    const page = await retrievePublicPage("https://example.org/large", { resolve, fetch: fetchPage });
+    expect(page.excerpt).toContain("Useful market evidence.");
+    expect(page.excerpt.length).toBeLessThanOrEqual(12_000);
+  });
+
+  it("accepts useful HTML when the response declares a larger content length", async () => {
+    const resolve = vi.fn(async () => [{ address: "8.8.8.8", family: 4 }]) as unknown as typeof lookup;
+    const fetchPage = vi.fn(async () => ({ status: 200, contentType: "text/html", contentLength: 128 * 1024, body: "<main>" + "Declared size is not a rejection. ".repeat(20) + "</main>" }));
+    const page = await retrievePublicPage("https://example.org/declared-large", { resolve, fetch: fetchPage });
+    expect(page.excerpt).toContain("Declared size is not a rejection.");
+  });
+
+  it("stops reading a streamed HTML response at the extraction budget", async () => {
+    const stop = vi.fn();
+    const stream = (async function* () {
+      yield new TextEncoder().encode("<main>Useful content early. ");
+      yield new Uint8Array(70 * 1024);
+      yield new TextEncoder().encode("unread content");
+    })();
+    const body = await boundedHtmlBody(stream, stop);
+    expect(body.length).toBe(64 * 1024);
+    expect(body).toContain("Useful content early.");
+    expect(stop).toHaveBeenCalledOnce();
+  });
+
+  it("rejects HTML that does not contain enough readable text", async () => {
+    const resolve = vi.fn(async () => [{ address: "8.8.8.8", family: 4 }]) as unknown as typeof lookup;
+    const fetchPage = vi.fn(async () => ({ status: 200, contentType: "text/html", body: "<html><body><script>short</script></body></html>" }));
+    await expect(retrievePublicPage("https://example.org/empty", { resolve, fetch: fetchPage })).rejects.toThrow("enough readable text");
+  });
+
+  it("rejects non-HTML responses and propagates fetch timeout errors", async () => {
+    const resolve = vi.fn(async () => [{ address: "8.8.8.8", family: 4 }]) as unknown as typeof lookup;
+    const nonHtml = vi.fn(async () => ({ status: 200, contentType: "application/pdf", body: "not HTML" }));
+    await expect(retrievePublicPage("https://example.org/document", { resolve, fetch: nonHtml })).rejects.toThrow("not HTML");
+    const timeout = vi.fn(async () => { throw new Error("Research page request timed out."); });
+    await expect(retrievePublicPage("https://example.org/slow", { resolve, fetch: timeout })).rejects.toThrow("timed out");
   });
 });
 

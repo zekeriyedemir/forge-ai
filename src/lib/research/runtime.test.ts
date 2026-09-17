@@ -36,6 +36,7 @@ describe("bounded evidence-backed research", () => {
     const provider: ResearchProvider = { name: "fake-search", search: vi.fn(async () => [{ title: "Survey", url: "https://example.org/survey", snippet: "Snippet" }]), retrieve: vi.fn(async () => { throw new Error("page failed"); }) };
     const analyze = vi.fn(async () => analysis);
     await expect(collectResearch("Build a customer support product", provider, analyze)).rejects.toThrow("no retrievable public HTML");
+    await expect(collectResearch("Build a customer support product", provider, analyze)).rejects.toThrow("1 other");
     expect(analyze).not.toHaveBeenCalled();
   });
 
