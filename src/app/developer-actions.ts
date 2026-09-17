@@ -5,7 +5,7 @@ import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { authenticatedUserId, projectForOwner } from "@/lib/access";
 import { db } from "@/lib/db";
-import { DeveloperFlowError, createCiCorrection, createDeveloperProposal, decideApproval, executeCiCorrection, executeImplementation, executeMerge, observeDeveloperCi, retryApproval } from "@/lib/developer/runtime";
+import { DeveloperFlowError, createCiCorrection, createDeveloperProposal, decideApproval, executeCiCorrection, executeExternalHeadAdoption, executeImplementation, executeMerge, observeDeveloperCi, reviewExternalHead, retryApproval } from "@/lib/developer/runtime";
 import { DeveloperProposalError, RepositoryValidationError } from "@/lib/developer/diagnostics";
 import { DeveloperGitHubError } from "@/lib/developer/github";
 import { AiProviderError } from "@/lib/agents/provider";
@@ -49,6 +49,7 @@ export async function decideDevelopment(projectId: string, approvalId: string, f
     if (decision === "approve") {
       if (action === "IMPLEMENT") await executeImplementation(projectId, approvalId, userId);
       else if (action === "FIX") await executeCiCorrection(projectId, approvalId, userId);
+      else if (action === "ADOPT") await executeExternalHeadAdoption(projectId, approvalId, userId);
       else await executeMerge(projectId, approvalId, userId);
     }
   } catch (cause) { error = message(cause); }
@@ -65,6 +66,7 @@ export async function retryDevelopment(projectId: string, approvalId: string) {
     await retryApproval(projectId, approvalId, userId);
     if (approval.action === "IMPLEMENT") await executeImplementation(projectId, approvalId, userId);
     else if (approval.action === "FIX") await executeCiCorrection(projectId, approvalId, userId);
+    else if (approval.action === "ADOPT") await executeExternalHeadAdoption(projectId, approvalId, userId);
     else await executeMerge(projectId, approvalId, userId);
   } catch (cause) { error = message(cause); }
   destination(projectId, error);
@@ -84,6 +86,15 @@ export async function proposeDevelopmentCorrection(projectId: string, executionI
   z.uuid().parse(executionId);
   let error: string | undefined;
   try { await createCiCorrection(projectId, executionId, userId); }
+  catch (cause) { error = message(cause); }
+  destination(projectId, error);
+}
+
+export async function reviewDevelopmentExternalHead(projectId: string, executionId: string) {
+  const userId = await identity(projectId);
+  z.uuid().parse(executionId);
+  let error: string | undefined;
+  try { await reviewExternalHead(projectId, executionId, userId); }
   catch (cause) { error = message(cause); }
   destination(projectId, error);
 }

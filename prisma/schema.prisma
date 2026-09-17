@@ -35,6 +35,7 @@ enum IntegrationType {
 enum ApprovalAction {
   IMPLEMENT
   FIX
+  ADOPT
   MERGE
 }
 
@@ -52,8 +53,14 @@ enum DeveloperStatus {
   BRANCH_CREATED
   COMMITTED
   PR_OPEN
+  EXTERNAL_CHANGE
   MERGED
   FAILED
+}
+
+enum DeveloperHeadSource {
+  FORGE
+  EXTERNAL
 }
 
 model User {
@@ -339,6 +346,8 @@ model DeveloperExecution {
   targetBranch      String
   baseSha           String
   commitSha         String?
+  headSource        DeveloperHeadSource @default(FORGE)
+  externalHeadSha   String?
   pullNumber        Int?
   pullUrl           String?
   pullState         String?

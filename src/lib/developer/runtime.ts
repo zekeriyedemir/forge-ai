@@ -3,11 +3,12 @@ import { ZodError } from "zod";
 import { db } from "@/lib/db";
 import { projectForOwner } from "@/lib/access";
 import { ciFixSchema, generatedProposalSchema, proposalSchema, featureBranch, safeTarget, shaSchema, type DeveloperProposal } from "./contracts";
-import { DeveloperGitHubError, developerGitHub, type DeveloperGitHub } from "./github";
+import { DeveloperGitHubError, developerGitHub, type DeveloperGitHub, type PullInfo } from "./github";
 import { generateCiFixProposal, generateDeveloperProposal } from "./proposal";
 import { DeveloperProposalError, RepositoryValidationError, schemaFields, type ProposalFailureStage } from "./diagnostics";
 
 export class DeveloperFlowError extends Error {}
+class StaleAdoptionError extends DeveloperFlowError {}
 const MAX_CORRECTIONS = 3;
 const staleExecutionBefore = () => new Date(Date.now() - 15 * 60_000);
 
@@ -108,6 +109,9 @@ export async function decideApproval(projectId: string, approvalId: string, user
   const approval = await db.approvalRequest.findFirst({ where: { id: approvalId, projectId }, include: { execution: true } });
   if (!approval) throw new DeveloperFlowError("Approval not found in this project.");
   if (approval.status !== "PENDING") throw new DeveloperFlowError("This approval has already been decided.");
+  if (approval.action === "ADOPT") {
+    if (approval.execution.status !== "EXTERNAL_CHANGE" || !approval.execution.externalHeadSha || approval.baseSha !== approval.execution.commitSha || approval.resultSha !== approval.execution.externalHeadSha) throw new DeveloperFlowError("This external-head review is stale. Refresh CI and request a new review.");
+  }
   if (approval.action === "MERGE" || approval.action === "FIX") {
     const pull = approval.execution;
     if (pull.status !== "PR_OPEN" || !pull.commitSha || !pull.pullNumber) throw new DeveloperFlowError("The implementation is not ready for merge approval.");
@@ -118,7 +122,7 @@ export async function decideApproval(projectId: string, approvalId: string, user
   return approval.action;
 }
 
-async function claimApproval(projectId: string, approvalId: string, action: "IMPLEMENT" | "FIX" | "MERGE") {
+async function claimApproval(projectId: string, approvalId: string, action: "IMPLEMENT" | "FIX" | "ADOPT" | "MERGE") {
   const approval = await db.approvalRequest.findFirst({ where: { id: approvalId, projectId, action } });
   if (!approval) throw new DeveloperFlowError("Approval not found.");
   if (approval.status === "EXECUTED") return false;
@@ -190,17 +194,102 @@ async function openPullForExecution(execution: { branch: string; targetBranch: s
   return pull;
 }
 
+function pullMatchesExecution(execution: { branch: string; targetBranch: string; pullNumber: number | null }, linked: { githubId: bigint }, pull: PullInfo) {
+  return pull.number === execution.pullNumber && pull.state === "open" && pull.head.ref === execution.branch && pull.base.ref === execution.targetBranch && pull.head.repo.id === Number(linked.githubId) && pull.base.repo.id === Number(linked.githubId);
+}
+
+async function markExternalHead(projectId: string, execution: { id: string; status: "PR_OPEN" | "EXTERNAL_CHANGE"; commitSha: string; externalHeadSha: string | null; pullNumber: number | null }, observedSha: string, identityValid: boolean) {
+  const current = shaSchema.parse(observedSha);
+  await db.$transaction(async tx => {
+    const changed = await tx.developerExecution.updateMany({ where: { id: execution.id, projectId, status: execution.status, commitSha: execution.commitSha, externalHeadSha: execution.externalHeadSha }, data: { status: "EXTERNAL_CHANGE", externalHeadSha: current, ciStatus: "UNAVAILABLE", ciSummary: identityValid ? "External PR head detected. Review and explicitly adopt it before CI can be trusted." : "The PR identity or branch reference changed. Review GitHub; adoption is blocked.", ciChecks: Prisma.JsonNull, validationSummary: "External PR change requires explicit review before correction or merge." } });
+    if (changed.count !== 1) throw new DeveloperFlowError("The PR changed during refresh. Refresh again.");
+    if (execution.externalHeadSha !== current) {
+      await tx.approvalRequest.updateMany({ where: { executionId: execution.id, action: "ADOPT", status: { in: ["PENDING", "APPROVED"] } }, data: { status: "REJECTED", error: "External head changed again. Refresh CI and review the new SHA." } });
+      await tx.activityEvent.create({ data: { projectId, kind: "developer", message: `External head detected on PR #${execution.pullNumber}: Forge ${execution.commitSha}, GitHub ${current}. Adoption required.` } });
+    }
+  });
+}
+
 export async function observeDeveloperCi(projectId: string, executionId: string, userId: string, client?: DeveloperGitHub) {
   await owner(projectId, userId);
   const execution = await db.developerExecution.findFirst({ where: { id: executionId, projectId } });
-  if (!execution || execution.status !== "PR_OPEN" || !execution.commitSha) throw new DeveloperFlowError("An open Forge pull request is required to inspect CI.");
+  if (!execution || !["PR_OPEN", "EXTERNAL_CHANGE"].includes(execution.status) || !execution.commitSha || !execution.pullNumber) throw new DeveloperFlowError("An open Forge pull request is required to inspect CI.");
   const headSha = execution.commitSha;
   const { linked, github } = await verifiedGitHub(projectId, userId, execution.repositoryId, client, execution.repositoryGithubId, execution.repositoryFullName);
-  await openPullForExecution(execution, linked, github);
+  const [branchHead, pull] = await Promise.all([github.ref(linked.fullName, execution.branch), github.pull(linked.fullName, execution.pullNumber)]);
+  const identityValid = pullMatchesExecution(execution, linked, pull) && branchHead === pull.head.sha;
+  if (execution.status === "EXTERNAL_CHANGE" || !identityValid || branchHead !== headSha || pull.head.sha !== headSha) {
+    await markExternalHead(projectId, { id: execution.id, status: execution.status as "PR_OPEN" | "EXTERNAL_CHANGE", commitSha: headSha, externalHeadSha: execution.externalHeadSha, pullNumber: execution.pullNumber }, pull.head.sha, identityValid);
+    return { state: "UNAVAILABLE" as const, summary: "External PR head requires explicit review before CI observation.", checks: [] };
+  }
   const snapshot = await github.ciSnapshot(linked.fullName, shaSchema.parse(headSha));
-  const updated = await db.developerExecution.updateMany({ where: { id: execution.id, projectId, status: "PR_OPEN", commitSha: headSha }, data: { ciStatus: snapshot.state, ciSummary: snapshot.summary, ciChecks: snapshot.checks as Prisma.InputJsonValue } });
+  const [confirmedBranchHead, confirmedPull] = await Promise.all([github.ref(linked.fullName, execution.branch), github.pull(linked.fullName, execution.pullNumber)]);
+  const confirmedIdentity = pullMatchesExecution(execution, linked, confirmedPull) && confirmedBranchHead === confirmedPull.head.sha;
+  if (!confirmedIdentity || confirmedBranchHead !== headSha || confirmedPull.head.sha !== headSha) {
+    await markExternalHead(projectId, { id: execution.id, status: "PR_OPEN", commitSha: headSha, externalHeadSha: null, pullNumber: execution.pullNumber }, confirmedPull.head.sha, confirmedIdentity);
+    return { state: "UNAVAILABLE" as const, summary: "External PR head requires explicit review before CI observation.", checks: [] };
+  }
+  const updated = await db.developerExecution.updateMany({ where: { id: execution.id, projectId, status: "PR_OPEN", commitSha: headSha, externalHeadSha: null }, data: { ciStatus: snapshot.state, ciSummary: snapshot.summary, ciChecks: snapshot.checks as Prisma.InputJsonValue } });
   if (updated.count !== 1) throw new DeveloperFlowError("The PR head changed during CI refresh. Refresh again for the current head.");
   return snapshot;
+}
+
+export async function reviewExternalHead(projectId: string, executionId: string, userId: string, client?: DeveloperGitHub) {
+  await owner(projectId, userId);
+  const execution = await db.developerExecution.findFirst({ where: { id: executionId, projectId } });
+  if (!execution || execution.status !== "EXTERNAL_CHANGE" || !execution.commitSha || !execution.externalHeadSha || !execution.pullNumber) throw new DeveloperFlowError("Refresh CI to detect an external PR head before requesting adoption.");
+  const { linked, github } = await verifiedGitHub(projectId, userId, execution.repositoryId, client, execution.repositoryGithubId, execution.repositoryFullName);
+  const [branchHead, pull] = await Promise.all([github.ref(linked.fullName, execution.branch), github.pull(linked.fullName, execution.pullNumber)]);
+  if (!pullMatchesExecution(execution, linked, pull) || branchHead !== pull.head.sha || pull.head.sha !== execution.externalHeadSha) throw new StaleAdoptionError("The PR or external head changed again. Refresh CI and review the current SHA.");
+  const active = await db.approvalRequest.findFirst({ where: { executionId, action: "ADOPT", status: { in: ["PENDING", "APPROVED", "EXECUTING"] } } });
+  if (active) {
+    if (active.baseSha !== execution.commitSha || active.resultSha !== execution.externalHeadSha) throw new StaleAdoptionError("An older adoption review is stale. Refresh CI and review the current SHA.");
+    return active;
+  }
+  const round = await db.approvalRequest.count({ where: { executionId, action: "ADOPT" } }) + 1;
+  return db.$transaction(async tx => {
+    const current = await tx.developerExecution.findUniqueOrThrow({ where: { id: executionId } });
+    if (current.status !== "EXTERNAL_CHANGE" || current.commitSha !== execution.commitSha || current.externalHeadSha !== execution.externalHeadSha) throw new StaleAdoptionError("The review changed while it was prepared. Refresh CI again.");
+    return tx.approvalRequest.create({ data: { projectId, executionId, runId: execution.runId, action: "ADOPT", round, requestedById: userId, description: `Review external head on PR #${execution.pullNumber}`, baseSha: execution.commitSha, resultSha: execution.externalHeadSha, payload: { repositoryId: linked.id, branch: execution.branch, target: execution.targetBranch, pullNumber: execution.pullNumber, headSha: execution.externalHeadSha } } });
+  });
+}
+
+export async function executeExternalHeadAdoption(projectId: string, approvalId: string, userId: string, client?: DeveloperGitHub) {
+  await owner(projectId, userId);
+  const approval = await db.approvalRequest.findFirst({ where: { id: approvalId, projectId, action: "ADOPT" }, include: { execution: true } });
+  if (!approval) throw new DeveloperFlowError("External-head approval not found.");
+  if (!await claimApproval(projectId, approvalId, "ADOPT")) return approval.execution;
+  const execution = approval.execution;
+  try {
+    if (execution.status !== "EXTERNAL_CHANGE" || !execution.commitSha || !approval.baseSha || !approval.resultSha || execution.commitSha !== approval.baseSha || execution.externalHeadSha !== approval.resultSha || !execution.pullNumber) throw new StaleAdoptionError("The external-head approval is stale. Refresh CI and request a new review.");
+    const payload = approval.payload as { repositoryId?: string; branch?: string; target?: string; pullNumber?: number; headSha?: string };
+    const { linked, github } = await verifiedGitHub(projectId, userId, execution.repositoryId, client, execution.repositoryGithubId, execution.repositoryFullName).catch(error => {
+      if (error instanceof DeveloperFlowError) throw new StaleAdoptionError(error.message);
+      throw error;
+    });
+    if (payload.repositoryId !== linked.id || payload.branch !== execution.branch || payload.target !== execution.targetBranch || payload.pullNumber !== execution.pullNumber || payload.headSha !== approval.resultSha) throw new StaleAdoptionError("The adoption approval does not match the linked repository or PR.");
+    const verifyHead = async () => {
+      const [branchHead, pull] = await Promise.all([github.ref(linked.fullName, execution.branch), github.pull(linked.fullName, execution.pullNumber!)]);
+      if (!pullMatchesExecution(execution, linked, pull) || branchHead !== approval.resultSha || pull.head.sha !== approval.resultSha) throw new StaleAdoptionError("The GitHub PR or branch changed after review. Refresh CI and request a new adoption approval.");
+    };
+    await verifyHead();
+    const ci = await github.ciSnapshot(linked.fullName, shaSchema.parse(approval.resultSha));
+    await verifyHead();
+    return await db.$transaction(async tx => {
+      const changed = await tx.developerExecution.updateMany({ where: { id: execution.id, projectId, status: "EXTERNAL_CHANGE", commitSha: approval.baseSha, externalHeadSha: approval.resultSha }, data: { status: "PR_OPEN", commitSha: approval.resultSha, externalHeadSha: null, headSource: "EXTERNAL", ciStatus: ci.state, ciSummary: ci.summary, ciChecks: ci.checks as Prisma.InputJsonValue, validationSummary: "External PR head explicitly adopted; Forge did not create this commit. Remote CI was refreshed.", error: null } });
+      if (changed.count !== 1) throw new StaleAdoptionError("The stored PR head changed during adoption. Refresh CI and review again.");
+      await tx.approvalRequest.updateMany({ where: { executionId: execution.id, action: { in: ["MERGE", "FIX"] }, status: { in: ["PENDING", "APPROVED", "EXECUTING", "FAILED"] } }, data: { status: "REJECTED", error: "External head adopted; this approval belongs to an older SHA." } });
+      const mergeRound = await tx.approvalRequest.count({ where: { executionId: execution.id, action: "MERGE" } });
+      await tx.approvalRequest.create({ data: { projectId, executionId: execution.id, runId: execution.runId, action: "MERGE", round: mergeRound, requestedById: userId, description: `Merge adopted PR #${execution.pullNumber} into ${execution.targetBranch}`, payload: { repositoryId: linked.id, branch: execution.branch, target: execution.targetBranch, pullNumber: execution.pullNumber, headSha: approval.resultSha } } });
+      await tx.approvalRequest.update({ where: { id: approvalId }, data: { status: "EXECUTED", executedAt: new Date(), error: null } });
+      await tx.activityEvent.create({ data: { projectId, kind: "developer", message: `External PR #${execution.pullNumber} head explicitly adopted: ${approval.baseSha} → ${approval.resultSha}. Forge did not create this commit.` } });
+      return tx.developerExecution.findUniqueOrThrow({ where: { id: execution.id } });
+    });
+  } catch (error) {
+    const message = safeError(error);
+    await db.approvalRequest.update({ where: { id: approvalId }, data: { status: error instanceof StaleAdoptionError ? "REJECTED" : "FAILED", error: message } });
+    throw new DeveloperFlowError(message);
+  }
 }
 
 export async function createCiCorrection(projectId: string, executionId: string, userId: string, client?: DeveloperGitHub, generator = generateCiFixProposal) {
@@ -275,8 +364,10 @@ export async function executeCiCorrection(projectId: string, approvalId: string,
     const updatedPull = await github.pull(linked.fullName, execution.pullNumber!);
     if (updatedPull.state !== "open" || updatedPull.head.sha !== resultSha || updatedPull.head.ref !== execution.branch || updatedPull.base.ref !== execution.targetBranch || updatedPull.head.repo.id !== Number(linked.githubId) || updatedPull.base.repo.id !== Number(linked.githubId)) throw new DeveloperFlowError("GitHub has not confirmed the corrected PR head. Retry after it updates; do not create another commit.");
     return await db.$transaction(async tx => {
-      const updated = await tx.developerExecution.update({ where: { id: execution.id }, data: { commitSha: resultSha, correctionCount: approval.round, ciStatus: "PENDING", ciSummary: "Waiting for CI on the corrected PR head.", ciChecks: Prisma.JsonNull, validationSummary: "Correction committed; remote CI must pass before merge.", error: null } });
-      await tx.approvalRequest.upsert({ where: { executionId_action_round: { executionId: execution.id, action: "MERGE", round: approval.round } }, create: { projectId, executionId: execution.id, runId: execution.runId, action: "MERGE", round: approval.round, requestedById: userId, description: `Merge corrected PR #${execution.pullNumber} into ${execution.targetBranch}`, payload: { repositoryId: linked.id, branch: execution.branch, target: execution.targetBranch, pullNumber: execution.pullNumber, headSha: resultSha } }, update: {} });
+      const updated = await tx.developerExecution.update({ where: { id: execution.id }, data: { commitSha: resultSha, headSource: "FORGE", correctionCount: approval.round, ciStatus: "PENDING", ciSummary: "Waiting for CI on the corrected PR head.", ciChecks: Prisma.JsonNull, validationSummary: "Correction committed; remote CI must pass before merge.", error: null } });
+      await tx.approvalRequest.updateMany({ where: { executionId: execution.id, action: "MERGE", status: { in: ["PENDING", "APPROVED", "EXECUTING", "FAILED"] } }, data: { status: "REJECTED", error: "A newer correction commit superseded this merge approval." } });
+      const mergeRound = await tx.approvalRequest.count({ where: { executionId: execution.id, action: "MERGE" } });
+      await tx.approvalRequest.upsert({ where: { executionId_action_round: { executionId: execution.id, action: "MERGE", round: mergeRound } }, create: { projectId, executionId: execution.id, runId: execution.runId, action: "MERGE", round: mergeRound, requestedById: userId, description: `Merge corrected PR #${execution.pullNumber} into ${execution.targetBranch}`, payload: { repositoryId: linked.id, branch: execution.branch, target: execution.targetBranch, pullNumber: execution.pullNumber, headSha: resultSha } }, update: {} });
       await tx.approvalRequest.update({ where: { id: approvalId }, data: { status: "EXECUTED", executedAt: new Date(), error: null } });
       await tx.activityEvent.create({ data: { projectId, kind: "developer", message: "Approved CI correction updated the pull request" } });
       return updated;
@@ -295,6 +386,7 @@ export async function executeMerge(projectId: string, approvalId: string, userId
   if (!await claimApproval(projectId, approvalId, "MERGE")) return approval.execution;
   const execution = approval.execution;
   try {
+    if (execution.status !== "PR_OPEN" || execution.externalHeadSha) throw new DeveloperFlowError("This PR has an unreviewed external change. Refresh CI and review the current head before merging.");
     const { linked, github } = await verifiedGitHub(projectId, userId, execution.repositoryId, client, execution.repositoryGithubId, execution.repositoryFullName);
     const payload = approval.payload as { repositoryId?: string; branch?: string; target?: string; pullNumber?: number; headSha?: string };
     if (payload.repositoryId !== linked.id || payload.branch !== execution.branch || payload.target !== execution.targetBranch || payload.pullNumber !== execution.pullNumber || payload.headSha !== execution.commitSha) throw new DeveloperFlowError("Merge approval no longer matches the implementation.");
