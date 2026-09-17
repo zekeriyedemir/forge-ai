@@ -40,6 +40,31 @@ describe("bounded evidence-backed research", () => {
     expect(analyze).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["ECONNRESET", "connection reset (ECONNRESET)"],
+    ["ECONNREFUSED", "connection unavailable (ECONNREFUSED)"],
+    ["EHOSTUNREACH", "connection unavailable (EHOSTUNREACH)"],
+    ["ENETUNREACH", "connection unavailable (ENETUNREACH)"],
+    ["ENOTFOUND", "DNS failure (ENOTFOUND)"],
+    ["EAI_AGAIN", "DNS failure (EAI_AGAIN)"],
+    ["CERT_HAS_EXPIRED", "TLS/certificate (CERT_HAS_EXPIRED)"],
+  ])("summarizes safe network failure code %s", async (code, category) => {
+    const failure = Object.assign(new Error("raw URL https://example.org/?token=secret and body must stay hidden"), { code });
+    const provider: ResearchProvider = { name: "fake-search", search: vi.fn(async query => [{ title: "Survey", url: `https://example.org/${encodeURIComponent(query)}`, snippet: "Snippet" }]), retrieve: vi.fn(async () => { throw failure; }) };
+    await expect(collectResearch("Build a customer support product", provider, async () => analysis)).rejects.toThrow(category);
+    await expect(collectResearch("Build a customer support product", provider, async () => analysis)).rejects.not.toThrow("secret");
+  });
+
+  it.each([
+    ["socket hang up", "socket closed"],
+    ["premature close", "socket closed"],
+    ["response was aborted", "aborted stream"],
+    ["Compressed research pages are unsupported", "content encoding"],
+  ])("summarizes safe stream failure %s", async (message, category) => {
+    const provider: ResearchProvider = { name: "fake-search", search: vi.fn(async query => [{ title: "Survey", url: `https://example.org/${encodeURIComponent(query)}`, snippet: "Snippet" }]), retrieve: vi.fn(async () => { throw new Error(message); }) };
+    await expect(collectResearch("Build a customer support product", provider, async () => analysis)).rejects.toThrow(category);
+  });
+
   it("caps unique page retrievals at six even when searches return more hits", async () => {
     let next = 0;
     const provider: ResearchProvider = { name: "fake-search", search: vi.fn(async () => Array.from({ length: 3 }, () => ({ title: "Page", url: `https://example.org/${next++}`, snippet: "" }))), retrieve: vi.fn(async url => ({ url, title: "Page", excerpt, retrievedAt: new Date() })) };

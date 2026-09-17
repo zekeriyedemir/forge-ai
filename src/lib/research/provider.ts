@@ -92,39 +92,45 @@ async function boundedBody(response: Response, limit: number): Promise<string> {
 export async function boundedHtmlBody(stream: AsyncIterable<Uint8Array>, stop: () => void = () => {}): Promise<string> {
   const chunks: Uint8Array[] = [];
   let size = 0;
-  for await (const chunk of stream) {
-    const remaining = MAX_PAGE_BYTES - size;
-    if (remaining <= 0) break;
-    chunks.push(chunk.subarray(0, remaining));
-    size += Math.min(chunk.byteLength, remaining);
-    if (size >= MAX_PAGE_BYTES) {
-      stop();
-      break;
+  let intentionallyStopped = false;
+  try {
+    for await (const chunk of stream) {
+      const remaining = MAX_PAGE_BYTES - size;
+      if (remaining <= 0) break;
+      chunks.push(chunk.subarray(0, remaining));
+      size += Math.min(chunk.byteLength, remaining);
+      if (size >= MAX_PAGE_BYTES) {
+        intentionallyStopped = true;
+        stop();
+        break;
+      }
     }
+  } catch (error) {
+    if (!intentionallyStopped) throw error;
   }
   return Buffer.concat(chunks).toString("utf8");
 }
 
 async function pinnedPage(url: URL, address: string): Promise<{ status: number; contentType: string; location?: string; body: string }> {
   return new Promise((resolve, reject) => {
-    const call = request(url, { method: "GET", timeout: 5_000, signal: AbortSignal.timeout(5_000), headers: { Accept: "text/html", "Accept-Encoding": "identity", "User-Agent": "ForgeResearch/1.0" }, lookup: (_hostname, _options, callback) => callback(null, address, 4) }, response => {
+    let settled = false;
+    const settle = (error?: Error, result?: { status: number; contentType: string; location?: string; body: string }) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve(result!);
+    };
+    const call = request(url, { method: "GET", timeout: 5_000, signal: AbortSignal.timeout(5_000), servername: url.hostname, headers: { Accept: "text/html", "Accept-Encoding": "identity", "User-Agent": "ForgeResearch/1.0" }, lookup: (_hostname, _options, callback) => callback(null, address, 4) }, response => {
       const status = response.statusCode ?? 0;
       const contentType = String(response.headers["content-type"] ?? "");
       const location = typeof response.headers.location === "string" ? response.headers.location : undefined;
-      if (response.headers["content-encoding"] && response.headers["content-encoding"] !== "identity") { response.destroy(); reject(new ResearchProviderError("Compressed research pages are unsupported.")); return; }
-      if (status >= 200 && status < 300 && !/^text\/html(?:;|$)/i.test(contentType)) { response.destroy(); reject(new ResearchProviderError("Research page was unavailable or not HTML.")); return; }
-      let settled = false;
-      const finish = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        if (error) reject(error);
-        else resolve({ status, contentType, location, body: responseBody });
-      };
+      if (response.headers["content-encoding"] && response.headers["content-encoding"] !== "identity") { response.destroy(); settle(new ResearchProviderError("Compressed research pages are unsupported.")); return; }
+      if (status >= 200 && status < 300 && !/^text\/html(?:;|$)/i.test(contentType)) { response.destroy(); settle(new ResearchProviderError("Research page was unavailable or not HTML.")); return; }
       let responseBody = "";
-      boundedHtmlBody(response, () => { response.pause(); response.destroy(); }).then(body => { responseBody = body; finish(); }).catch(error => finish(error));
+      boundedHtmlBody(response, () => { response.pause(); response.destroy(); }).then(body => { responseBody = body; settle(undefined, { status, contentType, location, body: responseBody }); }).catch(error => settle(error));
     });
-    call.on("timeout", () => call.destroy(new ResearchProviderError("Research page request timed out.")));
-    call.on("error", reject);
+    call.on("timeout", () => { const error = new ResearchProviderError("Research page request timed out."); call.destroy(error); settle(error); });
+    call.on("error", error => settle(error));
     call.end();
   });
 }

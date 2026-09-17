@@ -66,6 +66,19 @@ describe("public research network boundary", () => {
     expect(stop).toHaveBeenCalledOnce();
   });
 
+  it("treats an iterator error caused by intentional stopping as success", async () => {
+    let reads = 0;
+    const stream: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]() {
+        return {
+          next: async () => reads++ === 0 ? { value: new Uint8Array(64 * 1024), done: false } : { value: undefined, done: true },
+          return: async () => { throw new Error("aborted stream after intentional close"); },
+        } as AsyncIterator<Uint8Array>;
+      },
+    };
+    await expect(boundedHtmlBody(stream, vi.fn())).resolves.toHaveLength(64 * 1024);
+  });
+
   it("rejects HTML that does not contain enough readable text", async () => {
     const resolve = vi.fn(async () => [{ address: "8.8.8.8", family: 4 }]) as unknown as typeof lookup;
     const fetchPage = vi.fn(async () => ({ status: 200, contentType: "text/html", body: "<html><body><script>short</script></body></html>" }));

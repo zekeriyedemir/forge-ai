@@ -5,7 +5,15 @@ import { synthesizeResearch } from "./synthesis";
 export type ResearchResult = { analysis: ResearchAnalysis; sources: ResearchEvidence[]; queryCount: number; provider: string; partialFailures: number };
 
 function retrievalFailureCategory(error: unknown): string {
+  const code = error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : "";
   const message = error instanceof Error ? error.message.toLowerCase() : "";
+  if (["ECONNRESET"].includes(code)) return `connection reset (${code})`;
+  if (["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH"].includes(code)) return `connection unavailable (${code})`;
+  if (["ENOTFOUND", "EAI_AGAIN"].includes(code)) return `DNS failure (${code})`;
+  if (code.startsWith("CERT_") || code.startsWith("ERR_TLS") || ["DEPTH_ZERO_SELF_SIGNED_CERT", "UNABLE_TO_VERIFY_LEAF_SIGNATURE"].includes(code)) return `TLS/certificate (${code})`;
+  if (message.includes("content-encoding") || message.includes("compressed")) return "content encoding";
+  if (message.includes("socket hang up") || message.includes("premature close")) return "socket closed";
+  if (message.includes("aborted") || message.includes("destroyed")) return "aborted stream";
   if (message.includes("timed out") || message.includes("timeout")) return "timeout";
   if (message.includes("not html") || message.includes("unavailable")) return "non-html/unavailable";
   if (message.includes("public addresses") || message.includes("permitted public")) return "network policy";
