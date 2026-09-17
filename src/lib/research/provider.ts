@@ -1,6 +1,8 @@
 import { lookup } from "node:dns/promises";
 import { request } from "node:https";
 import { isIP } from "node:net";
+import type { LookupFunction } from "node:net";
+import type { RequestOptions } from "node:https";
 import { z } from "zod";
 
 const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
@@ -64,6 +66,18 @@ export function publicIpv4(address: string): boolean {
   return !(a === 0 || a === 10 || a === 127 || a >= 224 || a === 100 && b >= 64 && b <= 127 || a === 169 && b === 254 || a === 172 && b >= 16 && b <= 31 || a === 192 && (b === 168 || b === 0 && c === 0 || b === 88 && c === 99 || b === 0 && c === 2) || a === 198 && (b === 18 || b === 19 || b === 51 && c === 100) || a === 203 && b === 0 && c === 113 || a === 168 && b === 63 && c === 129 && address.endsWith(".16"));
 }
 
+export function pinnedLookup(address: string): LookupFunction {
+  if (!publicIpv4(address)) throw new ResearchProviderError("Research lookup address was not a permitted public IPv4 address.");
+  return (_hostname, options, callback) => {
+    if (options.all) callback(null, [{ address, family: 4 }]);
+    else callback(null, address, 4);
+  };
+}
+
+export function pinnedRequestOptions(url: URL, address: string): RequestOptions {
+  return { method: "GET", timeout: 5_000, signal: AbortSignal.timeout(5_000), servername: url.hostname, headers: { Accept: "text/html", "Accept-Encoding": "identity", "User-Agent": "ForgeResearch/1.0" }, lookup: pinnedLookup(address) };
+}
+
 export function extractHtmlText(html: string): { title: string; excerpt: string } {
   const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] ?? "Untitled page";
   const focus = /<(main|article)\b[^>]*>([\s\S]*?)<\/\1>/i.exec(html)?.[2] ?? html;
@@ -120,7 +134,7 @@ async function pinnedPage(url: URL, address: string): Promise<{ status: number; 
       if (error) reject(error);
       else resolve(result!);
     };
-    const call = request(url, { method: "GET", timeout: 5_000, signal: AbortSignal.timeout(5_000), servername: url.hostname, headers: { Accept: "text/html", "Accept-Encoding": "identity", "User-Agent": "ForgeResearch/1.0" }, lookup: (_hostname, _options, callback) => callback(null, address, 4) }, response => {
+    const call = request(url, pinnedRequestOptions(url, address), response => {
       const status = response.statusCode ?? 0;
       const contentType = String(response.headers["content-type"] ?? "");
       const location = typeof response.headers.location === "string" ? response.headers.location : undefined;

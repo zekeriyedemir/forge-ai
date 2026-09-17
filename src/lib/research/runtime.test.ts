@@ -65,6 +65,7 @@ describe("bounded evidence-backed research", () => {
     ["ENOTFOUND", "DNS failure (ENOTFOUND)"],
     ["EAI_AGAIN", "DNS failure (EAI_AGAIN)"],
     ["CERT_HAS_EXPIRED", "TLS/certificate (CERT_HAS_EXPIRED)"],
+    ["ERR_INVALID_IP_ADDRESS", "lookup/address configuration (ERR_INVALID_IP_ADDRESS)"],
   ])("summarizes safe network failure code %s", async (code, category) => {
     const failure = Object.assign(new Error("raw URL https://example.org/?token=secret and body must stay hidden"), { code });
     const provider: ResearchProvider = { name: "fake-search", search: vi.fn(async query => [{ title: "Survey", url: `https://example.org/${encodeURIComponent(query)}`, snippet: "Snippet" }]), retrieve: vi.fn(async () => { throw failure; }) };

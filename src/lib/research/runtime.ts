@@ -68,10 +68,12 @@ function retrievalFailureCategory(error: unknown): string {
   const unavailableCode = codes.find(item => ["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH"].includes(item));
   const dnsCode = codes.find(item => ["ENOTFOUND", "EAI_AGAIN"].includes(item));
   const tlsCode = codes.find(item => item.startsWith("CERT_") || item.startsWith("ERR_TLS") || ["DEPTH_ZERO_SELF_SIGNED_CERT", "UNABLE_TO_VERIFY_LEAF_SIGNATURE"].includes(item));
+  const lookupCode = codes.find(item => item === "ERR_INVALID_IP_ADDRESS");
   if (resetCode) return `connection reset (${resetCode})`;
   if (unavailableCode) return `connection unavailable (${unavailableCode})`;
   if (dnsCode) return `DNS failure (${dnsCode})`;
   if (tlsCode) return `TLS/certificate (${tlsCode})`;
+  if (lookupCode) return `lookup/address configuration (${lookupCode})`;
   if (message.includes("content-encoding") || message.includes("compressed")) return "content encoding";
   if (message.includes("socket hang up") || message.includes("premature close")) return "socket closed";
   if (message.includes("aborted") || message.includes("destroyed")) return "aborted stream";

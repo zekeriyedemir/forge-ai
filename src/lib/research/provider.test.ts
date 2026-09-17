@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { boundedHtmlBody, braveResearchProvider, extractHtmlText, publicIpv4, publicResearchUrl, researchProviderConfigured, researchProviderFromEnv, retrievePublicPage, searxngResearchProvider } from "./provider";
+import { boundedHtmlBody, braveResearchProvider, extractHtmlText, pinnedLookup, pinnedRequestOptions, publicIpv4, publicResearchUrl, researchProviderConfigured, researchProviderFromEnv, retrievePublicPage, searxngResearchProvider } from "./provider";
 import type { lookup } from "node:dns/promises";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -11,6 +11,32 @@ describe("public research network boundary", () => {
 
   it.each(["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.100.100.200", "198.18.0.1", "203.0.113.5", "168.63.129.16"])("blocks non-public address %s", address => {
     expect(publicIpv4(address)).toBe(false);
+  });
+
+  it("returns the pinned IPv4 in both lookup callback modes", () => {
+    const lookup = pinnedLookup("8.8.8.8");
+    const single = vi.fn();
+    lookup("example.org", { all: false }, single);
+    expect(single).toHaveBeenCalledWith(null, "8.8.8.8", 4);
+    expect(single.mock.calls[0][1]).not.toBeUndefined();
+    const all = vi.fn();
+    lookup("example.org", { all: true }, all);
+    expect(all).toHaveBeenCalledWith(null, [{ address: "8.8.8.8", family: 4 }]);
+    expect(all.mock.calls[0][1][0].address).not.toBeUndefined();
+  });
+
+  it("keeps the original hostname for TLS SNI and never delegates lookup", () => {
+    const options = pinnedRequestOptions(new URL("https://Example.org/path"), "8.8.8.8");
+    expect(options.servername).toBe("example.org");
+    const resolver = vi.fn();
+    options.lookup?.("example.org", { all: true }, resolver);
+    expect(resolver).toHaveBeenCalledWith(null, [{ address: "8.8.8.8", family: 4 }]);
+    expect(resolver.mock.calls[0][1][0].address).toBe("8.8.8.8");
+  });
+
+  it("never creates a pinned lookup for a private or invalid address", () => {
+    expect(() => pinnedLookup("127.0.0.1")).toThrow("permitted public IPv4");
+    expect(() => pinnedLookup("not-an-ip")).toThrow("permitted public IPv4");
   });
 
   it("pins a public DNS result, rejects mixed public/private results and unsafe redirects", async () => {
