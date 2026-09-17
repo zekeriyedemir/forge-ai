@@ -3,11 +3,12 @@ import { request } from "node:https";
 import { isIP } from "node:net";
 import { z } from "zod";
 
-const SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
+const BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search";
 const MAX_SEARCH_BYTES = 96 * 1024;
 const MAX_PAGE_BYTES = 64 * 1024;
 const MAX_EXCERPT = 12_000;
-const searchResponse = z.object({ web: z.object({ results: z.array(z.object({ title: z.string(), url: z.string(), description: z.string().nullish() })) }).optional() });
+const braveSearchResponse = z.object({ web: z.object({ results: z.array(z.object({ title: z.string(), url: z.string(), description: z.string().nullish() })) }).optional() });
+const searxngSearchResponse = z.object({ results: z.array(z.object({ title: z.string().nullish(), url: z.string().nullish(), content: z.string().nullish(), snippet: z.string().nullish(), description: z.string().nullish() })).default([]) });
 
 export type SearchHit = { title: string; url: string; snippet: string };
 export type RetrievedPage = { url: string; title: string; excerpt: string; retrievedAt: Date };
@@ -16,7 +17,31 @@ export interface ResearchProvider {
   search(query: string): Promise<SearchHit[]>;
   retrieve(url: string): Promise<RetrievedPage>;
 }
+export type ResearchProviderKind = "auto" | "searxng" | "brave";
 export class ResearchProviderError extends Error {}
+
+export function researchProviderConfigured(env: Record<string, string | undefined> = process.env): boolean {
+  const provider = (env.RESEARCH_PROVIDER ?? "auto").trim().toLowerCase() as ResearchProviderKind;
+  if (provider === "brave") return Boolean(env.BRAVE_SEARCH_API_KEY?.trim());
+  if (provider === "searxng") return Boolean(env.RESEARCH_SEARXNG_BASE_URL?.trim());
+  return Boolean(env.RESEARCH_SEARXNG_BASE_URL?.trim() || env.BRAVE_SEARCH_API_KEY?.trim());
+}
+
+export function researchProviderFromEnv(env: Record<string, string | undefined> = process.env): ResearchProvider {
+  const provider = (env.RESEARCH_PROVIDER ?? "auto").trim().toLowerCase() as ResearchProviderKind;
+  const selected = provider === "auto" ? (env.RESEARCH_SEARXNG_BASE_URL?.trim() ? "searxng" : env.BRAVE_SEARCH_API_KEY?.trim() ? "brave" : "none") : provider;
+  if (selected === "searxng") {
+    const base = env.RESEARCH_SEARXNG_BASE_URL?.trim();
+    if (!base) throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set RESEARCH_PROVIDER=searxng and RESEARCH_SEARXNG_BASE_URL for local research.");
+    return searxngResearchProvider(base);
+  }
+  if (selected === "brave") {
+    const apiKey = env.BRAVE_SEARCH_API_KEY?.trim();
+    if (!apiKey) throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set BRAVE_SEARCH_API_KEY for Brave search.");
+    return braveResearchProvider(apiKey);
+  }
+  throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set RESEARCH_PROVIDER=searxng with RESEARCH_SEARXNG_BASE_URL or provide BRAVE_SEARCH_API_KEY.");
+}
 
 export function publicResearchUrl(value: string): URL {
   let url: URL;
@@ -110,12 +135,55 @@ export async function retrievePublicPage(value: string, io: { resolve: typeof lo
   throw new ResearchProviderError("Research page could not be retrieved.");
 }
 
+function normalizeSearxngEndpoint(value: string): URL {
+  const base = new URL(value.trim());
+  if (!/^https?:$/i.test(base.protocol)) throw new ResearchProviderError("Research provider URL must use HTTPS.");
+  const candidate = new URL(base.toString());
+  if (/\/search$/i.test(candidate.pathname)) return candidate;
+  candidate.pathname = `${candidate.pathname.replace(/\/+$/, "")}/search`;
+  return candidate;
+}
+
+export function searxngResearchProvider(baseUrl: string): ResearchProvider {
+  const trimmed = baseUrl.trim();
+  if (!trimmed) throw new ResearchProviderError("Research provider is NOT CONFIGURED.");
+  const endpoint = normalizeSearxngEndpoint(trimmed);
+  return {
+    name: "searxng",
+    async search(query) {
+      const url = new URL(endpoint.toString());
+      url.searchParams.set("q", query.slice(0, 220));
+      url.searchParams.set("format", "json");
+      url.searchParams.set("count", "3");
+      url.searchParams.set("language", "en");
+      const response = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "ForgeResearch/1.0" }, signal: AbortSignal.timeout(8_000), cache: "no-store", redirect: "error" }).catch(() => { throw new ResearchProviderError("Research search request timed out, redirected, or could not connect."); });
+      if (response.status === 401 || response.status === 403) throw new ResearchProviderError("Research provider rejected its credentials or access.");
+      if (response.status === 429) throw new ResearchProviderError("Research provider rate limit reached.");
+      if (!response.ok) throw new ResearchProviderError(`Research search request failed (${response.status}).`);
+      let json: unknown;
+      const body = await boundedBody(response, MAX_SEARCH_BYTES);
+      try { json = JSON.parse(body); }
+      catch { throw new ResearchProviderError("Research provider returned malformed search JSON."); }
+      const payload = searxngSearchResponse.safeParse(json);
+      if (!payload.success) throw new ResearchProviderError("Research provider returned an invalid search result.");
+      return payload.data.results.slice(0, 3).flatMap(hit => {
+        const safeUrl = hit.url?.trim();
+        const snippetSource = hit.content ?? hit.snippet ?? hit.description ?? "";
+        if (!safeUrl) return [];
+        try { return [{ title: (hit.title ?? "Untitled result").slice(0, 200), url: publicResearchUrl(safeUrl).href, snippet: snippetSource.slice(0, 600) }]; }
+        catch { return []; }
+      });
+    },
+    retrieve: retrievePublicPage,
+  };
+}
+
 export function braveResearchProvider(apiKey: string): ResearchProvider {
   if (!apiKey.trim()) throw new ResearchProviderError("Research provider is NOT CONFIGURED.");
   return {
     name: "brave-search",
     async search(query) {
-      const url = new URL(SEARCH_ENDPOINT);
+      const url = new URL(BRAVE_SEARCH_ENDPOINT);
       url.searchParams.set("q", query.slice(0, 220));
       url.searchParams.set("count", "3");
       const response = await fetch(url, { headers: { "X-Subscription-Token": apiKey, Accept: "application/json" }, signal: AbortSignal.timeout(8_000), cache: "no-store", redirect: "error" }).catch(() => { throw new ResearchProviderError("Research search request timed out, redirected, or could not connect."); });
@@ -126,7 +194,7 @@ export function braveResearchProvider(apiKey: string): ResearchProvider {
       const body = await boundedBody(response, MAX_SEARCH_BYTES);
       try { json = JSON.parse(body); }
       catch { throw new ResearchProviderError("Research provider returned malformed search JSON."); }
-      const payload = searchResponse.safeParse(json);
+      const payload = braveSearchResponse.safeParse(json);
       if (!payload.success) throw new ResearchProviderError("Research provider returned an invalid search result.");
       return (payload.data.web?.results ?? []).slice(0, 3).flatMap(hit => {
         try { return [{ title: hit.title.slice(0, 200), url: publicResearchUrl(hit.url).href, snippet: (hit.description ?? "").slice(0, 600) }]; }

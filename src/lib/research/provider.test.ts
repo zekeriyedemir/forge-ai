@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { braveResearchProvider, extractHtmlText, publicIpv4, publicResearchUrl, retrievePublicPage } from "./provider";
+import { braveResearchProvider, extractHtmlText, publicIpv4, publicResearchUrl, researchProviderConfigured, researchProviderFromEnv, retrievePublicPage, searxngResearchProvider } from "./provider";
 import type { lookup } from "node:dns/promises";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -58,5 +58,30 @@ describe("Brave Search adapter", () => {
   it("rejects oversized search responses", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("x".repeat(97 * 1024), { status: 200 })));
     await expect(braveResearchProvider("fixture-key").search("query")).rejects.toThrow("size limit");
+  });
+});
+
+describe("SearXNG adapter and provider selection", () => {
+  it("supports a configured SearXNG endpoint and keeps only safe public results", async () => {
+    const fetcher = vi.fn<(input: URL, init: RequestInit) => Promise<Response>>(async () => new Response(JSON.stringify({ results: [{ title: "Public", url: "https://example.org/article?utm_source=ad", content: "A public page explains customer demand." }, { title: "Private", url: "http://localhost/private", content: "Blocked" }] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetcher);
+    const hits = await searxngResearchProvider("https://search.example.org").search("customer pain");
+    expect(hits).toEqual([{ title: "Public", url: "https://example.org/article", snippet: "A public page explains customer demand." }]);
+    expect(String(fetcher.mock.calls[0][0])).toContain("https://search.example.org/search?");
+    expect(fetcher).toHaveBeenCalledWith(expect.any(URL), expect.objectContaining({ headers: expect.objectContaining({ Accept: "application/json" }) }));
+  });
+
+  it("fails safely on malformed or unavailable SearXNG responses", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("not JSON", { status: 200 })));
+    await expect(searxngResearchProvider("https://search.example.org").search("query")).rejects.toThrow("malformed search JSON");
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 503 })));
+    await expect(searxngResearchProvider("https://search.example.org").search("query")).rejects.toThrow("failed");
+  });
+
+  it("chooses the zero-cost SearXNG provider when configured and leaves Brave optional", () => {
+    expect(researchProviderConfigured({ RESEARCH_PROVIDER: "searxng", RESEARCH_SEARXNG_BASE_URL: "https://search.example.org" })).toBe(true);
+    expect(researchProviderConfigured({ RESEARCH_PROVIDER: "brave", BRAVE_SEARCH_API_KEY: "" })).toBe(false);
+    expect(researchProviderConfigured({ RESEARCH_PROVIDER: "brave", BRAVE_SEARCH_API_KEY: "fixture-key" })).toBe(true);
+    expect(() => researchProviderFromEnv({ RESEARCH_PROVIDER: "brave" })).toThrow("NOT CONFIGURED");
   });
 });

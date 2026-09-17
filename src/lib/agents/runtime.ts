@@ -4,7 +4,7 @@ import { db } from "@/lib/db";
 import { AiProviderError, demoProvider, provider } from "./provider";
 import { MetricKeyConflictError, resultSchema, type AgentResult } from "./schemas";
 import { tools } from "./tools";
-import { braveResearchProvider, ResearchProviderError } from "../research/provider";
+import { researchProviderConfigured, researchProviderFromEnv, ResearchProviderError } from "../research/provider";
 import { collectResearch, researchReport, type ResearchResult } from "../research/runtime";
 import { ResearchSynthesisError } from "../research/synthesis";
 
@@ -56,10 +56,10 @@ export async function advanceWorkflow(projectId: string, workflowId: string) {
     let modelName: string;
     let result: AgentResult;
     if (liveResearch) {
-      const key = process.env.BRAVE_SEARCH_API_KEY?.trim();
-      if (!key) throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set BRAVE_SEARCH_API_KEY for live research.");
+      if (!researchProviderConfigured(process.env)) throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set RESEARCH_PROVIDER=searxng with RESEARCH_SEARXNG_BASE_URL or BRAVE_SEARCH_API_KEY.");
       if (!process.env.OPENAI_API_KEY?.trim()) throw new ResearchSynthesisError("AI provider is NOT CONFIGURED for research synthesis.");
-      research = await collectResearch(goal, braveResearchProvider(key));
+      const selected = researchProviderFromEnv(process.env);
+      research = await collectResearch(goal, selected);
       result = resultSchema.parse({ summary: research.analysis.summary, tasks: [], reports: [{ title: "Evidence-backed market research", kind: "research", content: researchReport(research) }], metrics: [] });
       providerName = `${research.provider}+openai-compatible`;
       modelName = process.env.OPENAI_MODEL ?? "openai-compatible";
@@ -101,7 +101,10 @@ export async function advanceWorkflow(projectId: string, workflowId: string) {
     console.error("Forge agent run failed", { runId: run.id, reason: message });
     const failed = await db.agentRun.updateMany({ where: { id: run.id, projectId, workflowId, status: "RUNNING", startedAt }, data: { status: "FAILED", error: message, completedAt: new Date() } });
     if (failed.count) {
-      if (run.type === "RESEARCH" && process.env.DEMO_MODE !== "true") await db.researchSession.upsert({ where: { runId: run.id }, create: { projectId, runId: run.id, provider: process.env.BRAVE_SEARCH_API_KEY?.trim() ? "brave-search" : "not-configured", status: "FAILED", limitations: message, completedAt: new Date() }, update: { status: "FAILED", limitations: message, completedAt: new Date() } });
+      if (run.type === "RESEARCH" && process.env.DEMO_MODE !== "true") {
+        const failedProvider = researchProviderConfigured(process.env) ? researchProviderFromEnv(process.env).name : "not-configured";
+        await db.researchSession.upsert({ where: { runId: run.id }, create: { projectId, runId: run.id, provider: failedProvider, status: "FAILED", limitations: message, completedAt: new Date() }, update: { status: "FAILED", limitations: message, completedAt: new Date() } });
+      }
       await db.agentEvent.create({ data: { runId: run.id, kind: "failed", message } });
       await db.agentRun.updateMany({ where: { workflowId, projectId, status: "PENDING" }, data: { status: "FAILED", error: "Skipped because an earlier agent failed", completedAt: new Date() } });
     }

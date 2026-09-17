@@ -19,7 +19,12 @@ vi.mock("@/lib/db", () => {
 });
 vi.mock("./tools", () => ({ tools: { readProjectContext: mocks.readContext, createTask: mocks.createTask, createReport: mocks.createReport, saveMetric: mocks.saveMetric } }));
 vi.mock("./provider", () => ({ AiProviderError: class AiProviderError extends Error {}, provider: () => ({ name: "mock", model: "test", generate: mocks.generate }), demoProvider: () => ({ name: "mock", model: "test", generate: mocks.generate }) }));
-vi.mock("../research/provider", () => ({ ResearchProviderError: class ResearchProviderError extends Error {}, braveResearchProvider: () => ({ name: "mock-search" }) }));
+vi.mock("../research/provider", () => ({
+  ResearchProviderError: class ResearchProviderError extends Error {},
+  researchProviderConfigured: (env: Record<string, string | undefined> = process.env) => Boolean(env.BRAVE_SEARCH_API_KEY?.trim() || env.RESEARCH_SEARXNG_BASE_URL?.trim()),
+  researchProviderFromEnv: (env: Record<string, string | undefined> = process.env) => ({ name: env.BRAVE_SEARCH_API_KEY?.trim() ? "brave-search" : "searxng" }),
+  braveResearchProvider: () => ({ name: "mock-search" }),
+}));
 vi.mock("../research/runtime", () => ({ collectResearch: mocks.collectResearch, researchReport: mocks.researchReport }));
 
 import { AiProviderError } from "./provider";
