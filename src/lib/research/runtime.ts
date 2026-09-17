@@ -96,9 +96,16 @@ function retrievalFailureSummary(results: PromiseSettledResult<unknown>[]): stri
   return [...counts.entries()].map(([category, count]) => `${count} ${category}`).join(", ");
 }
 
+function researchStageTiming(stage: string, event: "started" | "completed", startedAt: number) {
+  console.info("Forge stage timing", { stage: `${stage}.${event}`, elapsedMs: Math.max(0, Date.now() - startedAt) });
+}
+
 export async function collectResearch(goal: string, search: ResearchProvider, analyze = synthesizeResearch): Promise<ResearchResult> {
   const queries = researchQueries(goal);
+  const searchStartedAt = Date.now();
+  researchStageTiming("research.search", "started", searchStartedAt);
   const searches = await Promise.allSettled(queries.map(query => search.search(query)));
+  researchStageTiming("research.search", "completed", searchStartedAt);
   const candidates = new Map<string, { title: string; url: string; query: string }>();
   let partialFailures = searches.filter(result => result.status === "rejected").length;
   for (let rank = 0; rank < 2; rank++) {
@@ -113,7 +120,10 @@ export async function collectResearch(goal: string, search: ResearchProvider, an
     if (failure?.status === "rejected" && failure.reason instanceof ResearchProviderError) throw failure.reason;
     throw new ResearchProviderError("Research search returned no safe public results.");
   }
+  const retrieveStartedAt = Date.now();
+  researchStageTiming("research.retrieve", "started", retrieveStartedAt);
   const pages = await Promise.allSettled([...candidates.values()].map(async candidate => ({ ...await search.retrieve(candidate.url), query: candidate.query })));
+  researchStageTiming("research.retrieve", "completed", retrieveStartedAt);
   partialFailures += pages.filter(result => result.status === "rejected").length;
   const candidateList = [...candidates.values()];
   pages.forEach((result, index) => {

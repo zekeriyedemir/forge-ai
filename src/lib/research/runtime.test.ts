@@ -57,6 +57,17 @@ describe("bounded evidence-backed research", () => {
     expect(analyze).not.toHaveBeenCalled();
   });
 
+  it("keeps valid research when some page retrievals fail", async () => {
+    const provider: ResearchProvider = {
+      name: "fake-search",
+      search: vi.fn(async () => [{ title: "Good", url: "https://example.org/good", snippet: "Snippet" }, { title: "Bad", url: "https://example.org/bad", snippet: "Snippet" }]),
+      retrieve: vi.fn(async url => { if (url.endsWith("/bad")) throw new Error("not enough readable text"); return { url, title: "Good", excerpt, retrievedAt: new Date() }; }),
+    };
+    const result = await collectResearch("Build a customer support product", provider, async () => analysis);
+    expect(result.sources).toHaveLength(1);
+    expect(result.partialFailures).toBe(1);
+  });
+
   it.each([
     ["ECONNRESET", "connection reset (ECONNRESET)"],
     ["ECONNREFUSED", "connection unavailable (ECONNREFUSED)"],

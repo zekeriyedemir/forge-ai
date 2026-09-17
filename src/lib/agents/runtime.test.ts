@@ -29,6 +29,7 @@ vi.mock("../research/runtime", () => ({ collectResearch: mocks.collectResearch, 
 
 import { AiProviderError } from "./provider";
 import { advanceWorkflow, startWorkflow } from "./runtime";
+import { ResearchSynthesisError } from "../research/synthesis";
 
 const projectId = "project-id";
 const workflowId = "workflow-id";
@@ -157,6 +158,17 @@ describe("workflow persistence", () => {
     mocks.findRun.mockResolvedValue({ ...pendingRun, step: 1 });
     await expect(advanceWorkflow(projectId, workflowId)).rejects.toThrow("AI provider is NOT CONFIGURED");
     expect(mocks.collectResearch).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes a synthesis timeout from retrieval failure", async () => {
+    vi.stubEnv("DEMO_MODE", "false");
+    vi.stubEnv("BRAVE_SEARCH_API_KEY", "test-only-key");
+    vi.stubEnv("OPENAI_API_KEY", "test-only-ai-key");
+    mocks.findRun.mockResolvedValue({ ...pendingRun, step: 1 });
+    mocks.collectResearch.mockRejectedValue(new ResearchSynthesisError("Research AI request timed out."));
+    await expect(advanceWorkflow(projectId, workflowId)).rejects.toThrow("Research AI request timed out.");
+    expect(mocks.upsertSession).toHaveBeenCalledWith(expect.objectContaining({ create: expect.objectContaining({ status: "FAILED", limitations: "Research AI request timed out." }) }));
+    expect(mocks.upsertSession.mock.calls[0][0].create.limitations).not.toContain("retrievable public HTML");
   });
 
   it("does not persist research evidence after losing the run claim", async () => {

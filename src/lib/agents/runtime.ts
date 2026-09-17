@@ -10,6 +10,17 @@ import { ResearchSynthesisError } from "../research/synthesis";
 
 export const sequence: AgentType[] = ["FOUNDER", "RESEARCH", "FOUNDER", "DEVELOPER", "ANALYST"];
 
+function agentStageTiming(stage: string, event: "started" | "completed" | "failed", startedAt: number, error?: unknown) {
+  const details: { stage: string; elapsedMs: number; timeoutSource?: string } = { stage: `${stage}.${event}`, elapsedMs: Math.max(0, Date.now() - startedAt) };
+  if (event === "failed") {
+    const value = error && typeof error === "object" ? error : null;
+    const code = value && "code" in value && typeof value.code === "string" ? value.code : "";
+    const name = value && "name" in value && typeof value.name === "string" ? value.name : "";
+    details.timeoutSource = code || name || "unknown";
+  }
+  (event === "failed" ? console.error : console.info)("Forge stage timing", details);
+}
+
 export async function startWorkflow(projectId: string) {
   try {
     return await db.$transaction(async tx => {
@@ -70,7 +81,18 @@ export async function advanceWorkflow(projectId: string, workflowId: string) {
         const session = await db.researchSession.findFirst({ where: { projectId, run: { workflowId }, status: "COMPLETED" }, include: { findings: { include: { source: true }, take: 8 } } });
         verifiedResearch = session?.findings.map(finding => ({ area: finding.area, claim: finding.claim, quote: finding.quote, url: finding.source.url, limitation: finding.limitation })) ?? [];
       }
-      result = resultSchema.parse(await ai.generate(run.type, goal, JSON.stringify({ tasks: context.tasks.map(t => t.title), reports: context.reports.map(r => r.title), metrics: context.metrics, verifiedResearch })));
+      const aiStage = run.type === "FOUNDER" && run.step > 0 ? "founder.research-pass" : `${run.type.toLowerCase()}.ai`;
+      const aiStartedAt = Date.now();
+      agentStageTiming(aiStage, "started", aiStartedAt);
+      let generated: AgentResult;
+      try {
+        generated = await ai.generate(run.type, goal, JSON.stringify({ tasks: context.tasks.map(t => t.title), reports: context.reports.map(r => r.title), metrics: context.metrics, verifiedResearch }));
+      } catch (error) {
+        agentStageTiming(aiStage, "failed", aiStartedAt, error);
+        throw error;
+      }
+      agentStageTiming(aiStage, "completed", aiStartedAt);
+      result = resultSchema.parse(generated);
       providerName = ai.name;
       modelName = ai.model;
     }
