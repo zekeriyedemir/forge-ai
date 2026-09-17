@@ -4,14 +4,15 @@ const mocks = vi.hoisted(() => {
   class ProposalError extends Error { get publicMessage() { return `Proposal failed during structured output (INVALID_SCHEMA): ${this.message}`; } }
   class FlowError extends Error {}
   class GitHubError extends Error {}
+  class RepositoryError extends Error {}
   class AiError extends Error {}
-  return { ProposalError, FlowError, GitHubError, AiError, user: vi.fn(), owner: vi.fn(), create: vi.fn(), revalidate: vi.fn(), redirect: vi.fn() };
+  return { ProposalError, FlowError, GitHubError, RepositoryError, AiError, user: vi.fn(), owner: vi.fn(), create: vi.fn(), revalidate: vi.fn(), redirect: vi.fn() };
 });
 
 vi.mock("@/lib/access", () => ({ authenticatedUserId: mocks.user, projectForOwner: mocks.owner }));
 vi.mock("@/lib/db", () => ({ db: { approvalRequest: { findFirst: vi.fn() } } }));
 vi.mock("@/lib/developer/runtime", () => ({ DeveloperFlowError: mocks.FlowError, createDeveloperProposal: mocks.create, decideApproval: vi.fn(), executeImplementation: vi.fn(), executeMerge: vi.fn(), retryApproval: vi.fn() }));
-vi.mock("@/lib/developer/diagnostics", () => ({ DeveloperProposalError: mocks.ProposalError }));
+vi.mock("@/lib/developer/diagnostics", () => ({ DeveloperProposalError: mocks.ProposalError, RepositoryValidationError: mocks.RepositoryError }));
 vi.mock("@/lib/developer/github", () => ({ DeveloperGitHubError: mocks.GitHubError }));
 vi.mock("@/lib/agents/provider", () => ({ AiProviderError: mocks.AiError }));
 vi.mock("next/cache", () => ({ revalidatePath: mocks.revalidate }));

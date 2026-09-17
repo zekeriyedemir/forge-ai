@@ -34,6 +34,8 @@ enum IntegrationType {
 
 enum ApprovalAction {
   IMPLEMENT
+  FIX
+  ADOPT
   MERGE
 }
 
@@ -51,8 +53,14 @@ enum DeveloperStatus {
   BRANCH_CREATED
   COMMITTED
   PR_OPEN
+  EXTERNAL_CHANGE
   MERGED
   FAILED
+}
+
+enum DeveloperHeadSource {
+  FORGE
+  EXTERNAL
 }
 
 model User {
@@ -299,6 +307,7 @@ model ApprovalRequest {
   runId         String?
   executionId   String
   action        ApprovalAction
+  round         Int            @default(0)
   status        ApprovalStatus @default(PENDING)
   description   String         @db.Text
   payload       Json
@@ -309,13 +318,16 @@ model ApprovalRequest {
   executedAt    DateTime?
   updatedAt     DateTime       @updatedAt
   error         String?        @db.Text
+  baseSha       String?
+  resultSha     String?
+  failureSummary String?       @db.Text
   project       Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
   run           AgentRun?      @relation(fields: [runId], references: [id], onDelete: SetNull)
   execution     DeveloperExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
   requestedBy   User           @relation("RequestedApprovals", fields: [requestedById], references: [id])
   decidedBy     User?          @relation("DecidedApprovals", fields: [decidedById], references: [id])
 
-  @@unique([executionId, action])
+  @@unique([executionId, action, round])
   @@index([projectId, status, requestedAt])
 }
 
@@ -329,14 +341,21 @@ model DeveloperExecution {
   repositoryFullName String
   status            DeveloperStatus @default(PROPOSED)
   proposal          Json
+  inspectedPaths    Json            @default("[]")
   branch            String          @unique
   targetBranch      String
   baseSha           String
   commitSha         String?
+  headSource        DeveloperHeadSource @default(FORGE)
+  externalHeadSha   String?
   pullNumber        Int?
   pullUrl           String?
   pullState         String?
   validationSummary String?         @db.Text
+  ciStatus          String          @default("UNAVAILABLE")
+  ciSummary         String?         @db.Text
+  ciChecks          Json?
+  correctionCount   Int             @default(0)
   error             String?         @db.Text
   startedAt         DateTime?
   completedAt       DateTime?

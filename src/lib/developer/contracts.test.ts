@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { branchSchema, featureBranch, proposalSchema, safeTarget } from "./contracts";
+import { branchSchema, ciFixSchema, featureBranch, generatedProposalSchema, proposalSchema, safeTarget } from "./contracts";
 
 const valid = { task: "Add a useful endpoint", summary: "Add an endpoint that returns the current task list.", files: [{ path: "src/app/tasks/route.ts", content: "export const GET = () => Response.json([]);", reason: "Expose existing tasks to the UI" }], validationPlan: "Run unit tests and inspect CI on the pull request.", risks: "Access checks must remain server-side.", commitMessage: "feat: add task listing endpoint" };
 
@@ -35,5 +35,17 @@ describe("Developer proposal boundaries", () => {
     expect(proposalSchema.safeParse({ ...valid, files: Array(2).fill(valid.files[0]) }).success).toBe(false);
     expect(proposalSchema.safeParse({ ...valid, files: [{ ...valid.files[0], content: "x".repeat(32_001) }] }).success).toBe(false);
     expect(proposalSchema.safeParse({ ...valid, commitMessage: "changed stuff" }).success).toBe(false);
+  });
+
+  it("requires operations and CI expectations for new proposals while preserving legacy records", () => {
+    expect(proposalSchema.safeParse(valid).success).toBe(true);
+    expect(generatedProposalSchema.safeParse(valid).success).toBe(false);
+    const current = { ...valid, files: [{ ...valid.files[0], operation: "CREATE" }], validationExpectation: "The endpoint returns tasks and CI checks pass." };
+    expect(generatedProposalSchema.safeParse(current).success).toBe(true);
+    expect(generatedProposalSchema.safeParse({ ...current, summary: "DATABASE_URL=postgres://user:password@host/db" }).success).toBe(false);
+    expect(generatedProposalSchema.safeParse({ ...current, files: [{ ...current.files[0], path: "src/lib/api_key.ts" }] }).success).toBe(false);
+    expect(ciFixSchema.safeParse({ ...valid, failureSummary: "The build check failed in CI.", likelyCause: "The test assertion was incorrect." }).success).toBe(false);
+    expect(ciFixSchema.safeParse({ ...current, failureSummary: "The build check failed in CI.", likelyCause: "The test assertion was incorrect." }).success).toBe(true);
+    expect(ciFixSchema.safeParse({ ...current, failureSummary: "DATABASE_URL=postgres://user:password@host/db", likelyCause: "The test assertion was incorrect." }).success).toBe(false);
   });
 });
