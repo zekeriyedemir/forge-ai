@@ -63,6 +63,23 @@ enum DeveloperHeadSource {
   EXTERNAL
 }
 
+enum ResearchStatus {
+  COMPLETED
+  FAILED
+}
+
+enum ResearchArea {
+  MARKET
+  COMPETITORS
+  PRICING
+  CUSTOMER_PAIN
+  CUSTOMER_SEGMENTS
+  DEMAND
+  POSITIONING
+  DISTRIBUTION
+  OPPORTUNITY
+}
+
 model User {
   id            String            @id @default(uuid())
   name          String?
@@ -152,6 +169,7 @@ model Project {
   activity     ActivityEvent[]
   approvals    ApprovalRequest[]
   executions   DeveloperExecution[]
+  researchSessions ResearchSession[]
   createdAt    DateTime           @default(now())
   updatedAt    DateTime           @updatedAt
 
@@ -201,6 +219,7 @@ model AgentRun {
   events      AgentEvent[]
   approvals   ApprovalRequest[]
   executions  DeveloperExecution[]
+  researchSession ResearchSession?
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
 
@@ -299,6 +318,54 @@ model ActivityEvent {
   createdAt DateTime @default(now())
 
   @@index([projectId, createdAt])
+}
+
+model ResearchSession {
+  id          String         @id @default(uuid())
+  projectId   String
+  runId       String         @unique
+  provider    String
+  status      ResearchStatus
+  summary     String         @default("") @db.Text
+  limitations String         @default("") @db.Text
+  queryCount  Int            @default(0)
+  startedAt   DateTime       @default(now())
+  completedAt DateTime       @default(now())
+  project     Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  run         AgentRun       @relation(fields: [runId], references: [id], onDelete: Cascade)
+  sources     ResearchSource[]
+  findings    ResearchFinding[]
+
+  @@index([projectId, startedAt])
+}
+
+model ResearchSource {
+  id          String           @id @default(uuid())
+  sessionId   String
+  url         String           @db.Text
+  title       String
+  query       String
+  excerpt     String           @db.Text
+  retrievedAt DateTime
+  session     ResearchSession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  findings    ResearchFinding[]
+
+  @@index([sessionId])
+}
+
+model ResearchFinding {
+  id         String          @id @default(uuid())
+  sessionId  String
+  sourceId   String
+  area       ResearchArea
+  claim      String          @db.Text
+  quote      String          @db.Text
+  confidence String
+  limitation String          @db.Text
+  session    ResearchSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  source     ResearchSource  @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, area])
 }
 
 model ApprovalRequest {

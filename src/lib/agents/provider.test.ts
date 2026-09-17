@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const config = vi.hoisted(() => ({ demoMode: "true", apiKey: "" }));
 vi.mock("@/lib/env", () => ({ serverEnv: () => ({ DATABASE_URL: "postgresql://localhost/forge", AUTH_SECRET: "a".repeat(32), DEMO_MODE: config.demoMode, OPENAI_API_KEY: config.apiKey, OPENAI_BASE_URL: "https://example.test/v1/", OPENAI_MODEL: "test-model" }) }));
-import { AiProviderError, resultSchema, provider } from "./provider";
+import { AiProviderError, demoProvider, resultSchema, provider } from "./provider";
 
 beforeEach(() => { config.demoMode = "true"; config.apiKey = ""; vi.unstubAllGlobals(); });
 
@@ -14,6 +14,15 @@ describe("agent provider", () => {
       const output = await ai.generate(kind, "Build a useful product", "");
       expect(resultSchema.parse(output).summary).toBeTruthy();
     }
+  });
+
+  it("keeps the demo research outline mocked even if an AI key is configured", async () => {
+    config.apiKey = "test-only-key";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const demo = await demoProvider().generate("RESEARCH", "Build a useful product", "");
+    expect(demo.summary).toContain("Demo research outline");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("refuses an unconfigured non-demo deployment", () => {

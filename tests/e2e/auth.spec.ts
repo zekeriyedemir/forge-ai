@@ -15,3 +15,8 @@ test("Approval Center redirects anonymous visitors before project lookup", async
   await page.goto(`/dashboard/projects/${crypto.randomUUID()}/approvals`);
   await expect(page).toHaveURL(/\/login$/);
 });
+
+test("Research evidence redirects anonymous visitors before project lookup", async ({ page }) => {
+  await page.goto(`/dashboard/projects/${crypto.randomUUID()}/research`);
+  await expect(page).toHaveURL(/\/login$/);
+});

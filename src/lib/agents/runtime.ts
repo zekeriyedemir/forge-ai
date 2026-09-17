@@ -1,9 +1,12 @@
 import { AgentType } from "@prisma/client";
 import { ZodError } from "zod";
 import { db } from "@/lib/db";
-import { AiProviderError, provider } from "./provider";
-import { MetricKeyConflictError, resultSchema } from "./schemas";
+import { AiProviderError, demoProvider, provider } from "./provider";
+import { MetricKeyConflictError, resultSchema, type AgentResult } from "./schemas";
 import { tools } from "./tools";
+import { braveResearchProvider, ResearchProviderError } from "../research/provider";
+import { collectResearch, researchReport, type ResearchResult } from "../research/runtime";
+import { ResearchSynthesisError } from "../research/synthesis";
 
 export const sequence: AgentType[] = ["FOUNDER", "RESEARCH", "FOUNDER", "DEVELOPER", "ANALYST"];
 
@@ -46,13 +49,44 @@ export async function advanceWorkflow(projectId: string, workflowId: string) {
   try {
     await db.agentEvent.create({ data: { runId: run.id, kind: "started", message: `${run.type.toLowerCase()} agent started` } });
     const context = await tools.readProjectContext({ projectId, runId: run.id });
-    const ai = provider();
     const goal = context.goals[0]?.statement ?? "";
-    const result = resultSchema.parse(await ai.generate(run.type, goal, JSON.stringify({ tasks: context.tasks.map(t => t.title), reports: context.reports.map(r => r.title), metrics: context.metrics })));
+    const liveResearch = run.type === "RESEARCH" && process.env.DEMO_MODE !== "true";
+    let research: ResearchResult | null = null;
+    let providerName: string;
+    let modelName: string;
+    let result: AgentResult;
+    if (liveResearch) {
+      const key = process.env.BRAVE_SEARCH_API_KEY?.trim();
+      if (!key) throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set BRAVE_SEARCH_API_KEY for live research.");
+      if (!process.env.OPENAI_API_KEY?.trim()) throw new ResearchSynthesisError("AI provider is NOT CONFIGURED for research synthesis.");
+      research = await collectResearch(goal, braveResearchProvider(key));
+      result = resultSchema.parse({ summary: research.analysis.summary, tasks: [], reports: [{ title: "Evidence-backed market research", kind: "research", content: researchReport(research) }], metrics: [] });
+      providerName = `${research.provider}+openai-compatible`;
+      modelName = process.env.OPENAI_MODEL ?? "openai-compatible";
+    } else {
+      const ai = run.type === "RESEARCH" && process.env.DEMO_MODE === "true" ? demoProvider() : provider();
+      let verifiedResearch: { area: string; claim: string; quote: string; url: string; limitation: string }[] = [];
+      if (run.type === "FOUNDER" && run.step > 0) {
+        const session = await db.researchSession.findFirst({ where: { projectId, run: { workflowId }, status: "COMPLETED" }, include: { findings: { include: { source: true }, take: 8 } } });
+        verifiedResearch = session?.findings.map(finding => ({ area: finding.area, claim: finding.claim, quote: finding.quote, url: finding.source.url, limitation: finding.limitation })) ?? [];
+      }
+      result = resultSchema.parse(await ai.generate(run.type, goal, JSON.stringify({ tasks: context.tasks.map(t => t.title), reports: context.reports.map(r => r.title), metrics: context.metrics, verifiedResearch })));
+      providerName = ai.name;
+      modelName = ai.model;
+    }
     const committed = await db.$transaction(async tx => {
       // A stale worker may have been reclaimed while the provider was running.
-      const owned = await tx.agentRun.updateMany({ where: { id: run.id, projectId, workflowId, status: "RUNNING", startedAt }, data: { status: "COMPLETED", output: result, provider: ai.name, model: ai.model, error: null, completedAt: new Date() } });
+      const owned = await tx.agentRun.updateMany({ where: { id: run.id, projectId, workflowId, status: "RUNNING", startedAt }, data: { status: "COMPLETED", output: result, provider: providerName, model: modelName, error: null, completedAt: new Date() } });
       if (owned.count === 0) return false;
+      if (research) {
+        const session = await tx.researchSession.create({ data: { projectId, runId: run.id, provider: research.provider, status: "COMPLETED", summary: research.analysis.summary, limitations: research.analysis.limitations, queryCount: research.queryCount, startedAt, completedAt: new Date() } });
+        const sourceIds: string[] = [];
+        for (const source of research.sources) {
+          const saved = await tx.researchSource.create({ data: { sessionId: session.id, url: source.url, title: source.title, query: source.query, excerpt: source.excerpt, retrievedAt: source.retrievedAt } });
+          sourceIds.push(saved.id);
+        }
+        for (const finding of research.analysis.findings) await tx.researchFinding.create({ data: { sessionId: session.id, sourceId: sourceIds[finding.sourceIndex], area: finding.area, claim: finding.claim, quote: finding.quote, confidence: finding.confidence, limitation: finding.limitation } });
+      }
       const writeContext = { projectId, runId: run.id, client: tx };
       for (const task of result.tasks) await tools.createTask(writeContext, task);
       for (const report of result.reports) await tools.createReport(writeContext, report);
@@ -63,10 +97,11 @@ export async function advanceWorkflow(projectId: string, workflowId: string) {
     }, { isolationLevel: "Serializable", timeout: 15_000 });
     if (!committed) return run;
   } catch (error) {
-    const message = error instanceof AiProviderError || error instanceof MetricKeyConflictError ? error.message : error instanceof ZodError ? "AI provider returned an invalid structured result." : "Agent execution failed. Please retry.";
+    const message = error instanceof AiProviderError || error instanceof MetricKeyConflictError || error instanceof ResearchProviderError || error instanceof ResearchSynthesisError ? error.message : error instanceof ZodError ? "AI provider returned an invalid structured result." : "Agent execution failed. Please retry.";
     console.error("Forge agent run failed", { runId: run.id, reason: message });
     const failed = await db.agentRun.updateMany({ where: { id: run.id, projectId, workflowId, status: "RUNNING", startedAt }, data: { status: "FAILED", error: message, completedAt: new Date() } });
     if (failed.count) {
+      if (run.type === "RESEARCH" && process.env.DEMO_MODE !== "true") await db.researchSession.upsert({ where: { runId: run.id }, create: { projectId, runId: run.id, provider: process.env.BRAVE_SEARCH_API_KEY?.trim() ? "brave-search" : "not-configured", status: "FAILED", limitations: message, completedAt: new Date() }, update: { status: "FAILED", limitations: message, completedAt: new Date() } });
       await db.agentEvent.create({ data: { runId: run.id, kind: "failed", message } });
       await db.agentRun.updateMany({ where: { workflowId, projectId, status: "PENDING" }, data: { status: "FAILED", error: "Skipped because an earlier agent failed", completedAt: new Date() } });
     }
