@@ -1,6 +1,6 @@
 # Forge AI
 
-Forge AI is a business-building command center. A founder enters a goal, and four coordinated agents create strategy, research outlines, an MVP plan, tasks, reports, and progress metrics. This V1 does not claim to autonomously create revenue.
+Forge AI is a business-building command center. A founder enters a goal, and four coordinated agents create strategy, evidence-backed research when configured, an MVP plan, tasks, reports, and progress metrics. Forge does not claim to autonomously create revenue.
 
 ## Screenshots
 
@@ -20,6 +20,8 @@ Next.js App Router, React, strict TypeScript, Tailwind CSS, PostgreSQL, Prisma, 
 For a credential-free demo, set `DEMO_MODE=true` and leave `OPENAI_API_KEY` empty. Demo mode uses a shared, disposable account and deterministic, labeled output; it does not perform live market research. Keep it off for private production data. If `DEMO_MODE=false` and no AI key is set, workflows fail with a configuration message instead of silently using mock output.
 
 For live AI, set `OPENAI_API_KEY` and choose an OpenAI-compatible `OPENAI_BASE_URL` and `OPENAI_MODEL` that support Chat Completions JSON mode. The key stays on the server. Forge validates each complete result with Zod, retries malformed structured output once, and records a failed run if it remains invalid. No real AI call is needed to run tests. To smoke-test your own provider, use a disposable project, start a workflow, and inspect its run status, events, tasks, reports, and metric keys; automated tests use fake responses.
+
+For **live research**, also set server-only `BRAVE_SEARCH_API_KEY` from [Brave Search API](https://api-dashboard.search.brave.com/documentation/services/web-search) and use `DEMO_MODE=false`. The Research step makes up to five search requests, retrieves at most six public HTML pages, validates exact source quotes, and saves findings under **Project → Research**. The later Founder step consumes findings from that workflow. Without both the search and AI credentials, live research is **NOT CONFIGURED** and fails visibly; demo mode keeps its labeled **MOCKED** outline with no claimed live evidence. See [Research](docs/research.md) for configuration, limits, and manual verification.
 
 GitHub login requires `AUTH_GITHUB_ID` and `AUTH_GITHUB_SECRET` from a GitHub OAuth app. Add `http://localhost:3000/api/auth/callback/github` as its local callback. Auth.js v5 infers the normal host, so `AUTH_URL` is usually unnecessary. After signing in, open **Dashboard → Integrations** to see your authorized public and private repositories even before creating a project. Create a project to link one. A demo-only session cannot access GitHub repositories. Signed-in project owners can permanently delete a project under **Project → Settings** by typing its exact name; deletion also removes its goals, workflows, tasks, reports, metrics, activity, and repository link. See [deployment](docs/deployment.md) for production callback setup.
 

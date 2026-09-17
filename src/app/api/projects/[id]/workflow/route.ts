@@ -4,6 +4,8 @@ import { advanceWorkflow, startWorkflow } from "@/lib/agents/runtime";
 import { db } from "@/lib/db";
 import { z } from "zod";
 
+export const maxDuration = 120;
+
 export async function POST(_: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   if (!z.uuid().safeParse(id).success) return NextResponse.json({ error: "Invalid project ID" }, { status: 400 });
