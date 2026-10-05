@@ -9,9 +9,18 @@ beforeEach(() => {
   vi.unstubAllGlobals();
   process.env.AUTH_GITHUB_ID = "test-client";
   process.env.AUTH_GITHUB_SECRET = "test-secret";
+  process.env.DEMO_MODE = "false";
 });
 
 describe("GitHub token handling", () => {
+  it("isolates demo mode from real stored credentials", async () => {
+    process.env.DEMO_MODE = "true";
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(githubToken("user-id")).rejects.toThrow("disabled in demo mode");
+    expect(mocks.findAccount).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
   it("uses an unexpired stored token without a network request", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
@@ -44,7 +53,7 @@ describe("GitHub token handling", () => {
 
   it("uses the persisted token to list both public and private repositories", async () => {
     mocks.findAccount.mockResolvedValue({ access_token: "stored-token", expires_at: null });
-    const repositories = [{ id: 1, private: false }, { id: 2, private: true }];
+    const repositories = [{ id: 1, private: false, full_name: "owner/public", html_url: "https://github.com/owner/public", default_branch: "main" }, { id: 2, private: true, full_name: "owner/private", html_url: "https://github.com/owner/private", default_branch: "main" }];
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => repositories });
     vi.stubGlobal("fetch", fetchMock);
     expect(await listRepositories("user-id")).toEqual(repositories);
@@ -55,5 +64,19 @@ describe("GitHub token handling", () => {
     mocks.findAccount.mockResolvedValue({ access_token: "invalid-token", expires_at: null });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 401 }));
     await expect(listRepositories("user-id")).rejects.toThrow("authorization is no longer valid");
+  });
+
+  it("returns only validated repository fields and excludes upstream extras", async () => {
+    mocks.findAccount.mockResolvedValue({ access_token: "stored-token", expires_at: null });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => [{ id: 1, private: true, full_name: "owner/private", html_url: "https://github.com/owner/private", default_branch: "main", owner: { email: "private@example.test" }, unexpected: "upstream-only" }] }));
+    const repositories = await listRepositories("user-id");
+    expect(repositories[0]).not.toHaveProperty("owner");
+    expect(repositories[0]).not.toHaveProperty("unexpected");
+  });
+
+  it.each(["javascript:alert(1)", "not a url"])("rejects an invalid repository URL (%s) with a safe integration error", async html_url => {
+    mocks.findAccount.mockResolvedValue({ access_token: "stored-token", expires_at: null });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => [{ id: 1, private: false, full_name: "owner/public", html_url, default_branch: "main" }] }));
+    await expect(listRepositories("user-id")).rejects.toThrow("incomplete repository details");
   });
 });

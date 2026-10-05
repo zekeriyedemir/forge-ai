@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  findRun: vi.fn(), createRun: vi.fn(), updateMany: vi.fn(), transaction: vi.fn(),
+  findRun: vi.fn(), countRuns: vi.fn(), createRun: vi.fn(), updateMany: vi.fn(), transaction: vi.fn(),
   findGoal: vi.fn(), upsertAgent: vi.fn(), createEvent: vi.fn(), createActivity: vi.fn(),
   readContext: vi.fn(), createTask: vi.fn(), createReport: vi.fn(), saveMetric: vi.fn(), generate: vi.fn(),
   collectResearch: vi.fn(), researchReport: vi.fn(), createSession: vi.fn(), createSource: vi.fn(), createFinding: vi.fn(), upsertSession: vi.fn(), findSession: vi.fn(),
@@ -9,7 +9,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/lib/db", () => {
   const tx = {
-    agentRun: { findFirst: mocks.findRun, create: mocks.createRun, updateMany: mocks.updateMany },
+    agentRun: { findFirst: mocks.findRun, count: mocks.countRuns, create: mocks.createRun, updateMany: mocks.updateMany },
     businessGoal: { findFirst: mocks.findGoal }, agent: { upsert: mocks.upsertAgent },
     agentEvent: { create: mocks.createEvent }, activityEvent: { create: mocks.createActivity },
     researchSession: { create: mocks.createSession, upsert: mocks.upsertSession, findFirst: mocks.findSession },
@@ -40,6 +40,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.spyOn(console, "error").mockImplementation(() => {});
   mocks.findRun.mockResolvedValue(null);
+  mocks.countRuns.mockResolvedValue(0);
   mocks.findGoal.mockResolvedValue({ statement: "Build a useful service" });
   mocks.upsertAgent.mockResolvedValue({ id: "agent-id" });
   mocks.updateMany.mockResolvedValue({ count: 1 });
@@ -70,6 +71,24 @@ describe("workflow persistence", () => {
     expect(mocks.createActivity).not.toHaveBeenCalled();
   });
 
+  it("enforces the hourly limit within the same serializable transaction as new runs", async () => {
+    mocks.countRuns.mockResolvedValue(5);
+    await expect(startWorkflow(projectId)).rejects.toThrow("Workflow limit reached");
+    expect(mocks.transaction).toHaveBeenCalledWith(expect.any(Function), expect.objectContaining({ isolationLevel: "Serializable" }));
+    expect(mocks.createRun).not.toHaveBeenCalled();
+    mocks.findRun.mockResolvedValue({ workflowId });
+    expect(await startWorkflow(projectId)).toBe(workflowId);
+    expect(mocks.countRuns).toHaveBeenCalledOnce();
+  });
+
+  it("retries serialization conflicts and reuses the concurrently queued workflow", async () => {
+    mocks.findRun.mockResolvedValueOnce(null).mockResolvedValueOnce({ workflowId });
+    mocks.createRun.mockRejectedValueOnce({ code: "P2034" });
+    expect(await startWorkflow(projectId)).toBe(workflowId);
+    expect(mocks.transaction).toHaveBeenCalledTimes(2);
+    expect(mocks.createActivity).not.toHaveBeenCalled();
+  });
+
   it("validates first, then writes output and completion in one transaction", async () => {
     mocks.findRun.mockResolvedValue(pendingRun);
     mocks.generate.mockResolvedValue({ summary: "Research outline ready", tasks: [{ title: "Interview users", description: "Ask about workflows" }], reports: [{ title: "Outline", kind: "research", content: "Unverified hypothesis" }], metrics: [{ key: "Discovery Interviews", label: "Discovery interviews", value: 0, unit: "" }] });
@@ -82,15 +101,22 @@ describe("workflow persistence", () => {
     expect(mocks.createEvent).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ kind: "completed" }) }));
   });
 
+  it("keeps the queued workflow goal stable when the project goal changes mid-run", async () => {
+    mocks.findRun.mockResolvedValue({ ...pendingRun, input: { goal: "Build the original support tool" } });
+    mocks.readContext.mockResolvedValue({ goals: [{ statement: "A different new project goal" }], tasks: [], reports: [], metrics: [] });
+    await advanceWorkflow(projectId, workflowId);
+    expect(mocks.generate).toHaveBeenCalledWith("RESEARCH", "Build the original support tool", expect.any(String));
+  });
+
   it("persists a failed run and skips later steps without writing invalid model output", async () => {
     mocks.findRun.mockResolvedValue(pendingRun);
     mocks.generate.mockResolvedValue({ summary: "Bad output", tasks: [{ title: "x", description: "" }], reports: [], metrics: [] });
     await expect(advanceWorkflow(projectId, workflowId)).rejects.toThrow();
-    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.transaction).toHaveBeenCalledOnce();
     expect(mocks.createTask).not.toHaveBeenCalled();
     expect(mocks.createReport).not.toHaveBeenCalled();
     expect(mocks.saveMetric).not.toHaveBeenCalled();
-    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "FAILED", error: "AI provider returned an invalid structured result." }) }));
+    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "FAILED", error: "We couldn't complete this workflow. Please try again." }) }));
     expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: { workflowId, projectId, status: "PENDING" }, data: expect.objectContaining({ status: "FAILED" }) }));
     expect(mocks.createEvent).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ kind: "failed" }) }));
   });
@@ -100,8 +126,8 @@ describe("workflow persistence", () => {
     mocks.generate.mockRejectedValue(new AiProviderError("AI provider returned an invalid structured result after one retry."));
     await expect(advanceWorkflow(projectId, workflowId)).rejects.toThrow("invalid structured result");
     expect(mocks.createTask).not.toHaveBeenCalled();
-    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "FAILED", error: "AI provider returned an invalid structured result after one retry." }) }));
-    expect(console.error).toHaveBeenCalledWith("Forge agent run failed", { runId: "run-id", reason: "AI provider returned an invalid structured result after one retry." });
+    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "FAILED", error: "We couldn't get a complete response from the AI provider. Please try again or check your AI configuration." }) }));
+    expect(console.error).toHaveBeenCalledWith("Forge agent run failed", { projectId, workflowId, runId: "run-id", code: "AI_PROVIDER" });
   });
 
   it("reclaims stale executions but ignores a worker that lost its claim", async () => {
@@ -121,6 +147,33 @@ describe("workflow persistence", () => {
     await advanceWorkflow(projectId, workflowId);
     expect(mocks.generate).not.toHaveBeenCalled();
     expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+
+  it("recovers a running record whose worker never saved a start timestamp", async () => {
+    mocks.findRun.mockResolvedValue({ ...pendingRun, status: "RUNNING", startedAt: null });
+    await advanceWorkflow(projectId, workflowId);
+    expect(mocks.updateMany).toHaveBeenNthCalledWith(1, expect.objectContaining({ where: { id: "run-id", status: "RUNNING", startedAt: null }, data: expect.objectContaining({ status: "PENDING" }) }));
+    expect(mocks.generate).toHaveBeenCalledOnce();
+  });
+
+  it("does not cancel the replacement worker's steps when a stale worker fails", async () => {
+    mocks.findRun.mockResolvedValue(pendingRun);
+    mocks.generate.mockRejectedValue(new Error("private failure details"));
+    mocks.updateMany.mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 });
+    await expect(advanceWorkflow(projectId, workflowId)).rejects.toThrow("private failure details");
+    expect(mocks.updateMany).toHaveBeenCalledTimes(2);
+    expect(mocks.createEvent).not.toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ kind: "failed" }) }));
+    expect(JSON.stringify(mocks.updateMany.mock.calls)).not.toContain("private failure details");
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain("private failure details");
+  });
+
+  it("retries failure persistence atomically after a serialization conflict", async () => {
+    mocks.findRun.mockResolvedValue(pendingRun);
+    mocks.generate.mockRejectedValue(new AiProviderError("Provider failed"));
+    mocks.createEvent.mockResolvedValueOnce({}).mockRejectedValueOnce({ code: "P2034" });
+    await expect(advanceWorkflow(projectId, workflowId)).rejects.toThrow("Provider failed");
+    expect(mocks.transaction).toHaveBeenCalledTimes(2);
+    expect(mocks.updateMany).toHaveBeenLastCalledWith(expect.objectContaining({ where: { workflowId, projectId, status: "PENDING" }, data: expect.objectContaining({ status: "FAILED" }) }));
   });
 
   it("persists retrieved research and exact-source findings atomically, then makes them available to Founder", async () => {
@@ -167,7 +220,7 @@ describe("workflow persistence", () => {
     mocks.findRun.mockResolvedValue({ ...pendingRun, step: 1 });
     mocks.collectResearch.mockRejectedValue(new ResearchSynthesisError("Research AI request timed out."));
     await expect(advanceWorkflow(projectId, workflowId)).rejects.toThrow("Research AI request timed out.");
-    expect(mocks.upsertSession).toHaveBeenCalledWith(expect.objectContaining({ create: expect.objectContaining({ status: "FAILED", limitations: "Research AI request timed out." }) }));
+    expect(mocks.upsertSession).toHaveBeenCalledWith(expect.objectContaining({ create: expect.objectContaining({ status: "FAILED", limitations: "We couldn't finish analyzing the research. Please try again." }) }));
     expect(mocks.upsertSession.mock.calls[0][0].create.limitations).not.toContain("retrievable public HTML");
   });
 

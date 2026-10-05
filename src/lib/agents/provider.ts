@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { serverEnv } from "@/lib/env";
 import { resultSchema, type AgentResult } from "./schemas";
+import { ProviderResponseError, readProviderJson } from "./response";
 
 export { resultSchema } from "./schemas";
 export type { AgentResult } from "./schemas";
@@ -14,14 +15,19 @@ export interface AiProvider {
 
 export class AiProviderError extends Error {}
 
-const completionSchema = z.object({ choices: z.array(z.object({ message: z.object({ content: z.union([z.string(), z.array(z.object({ type: z.literal("text"), text: z.string() }))]).nullable() }), finish_reason: z.string().nullable().optional() })).min(1) });
+const completionSchema = z.object({ error: z.unknown().optional(), choices: z.array(z.object({ error: z.unknown().optional(), message: z.object({ content: z.union([z.string(), z.array(z.object({ type: z.literal("text"), text: z.string() }))]).nullable(), refusal: z.unknown().optional(), tool_calls: z.array(z.unknown()).optional() }), finish_reason: z.string().nullable().optional(), native_finish_reason: z.string().nullish() })).min(1) });
 const maxStructuredAttempts = 2;
+// Two attempts must leave room for database persistence in the 120s route budget.
+export const AGENT_REQUEST_TIMEOUT_MS = 40_000;
 
 function parseStructuredResult(payload: unknown): { result: AgentResult; hint?: never } | { result?: never; hint: string } {
   const completion = completionSchema.safeParse(payload);
   if (!completion.success) return { hint: "Return a chat completion with a text message containing the JSON object." };
   const choice = completion.data.choices[0];
-  if (choice.finish_reason === "length") return { hint: "The response was truncated. Return a shorter complete JSON object." };
+  if (completion.data.error != null || choice.error != null) throw new AiProviderError("AI provider returned an error instead of a result.");
+  if (choice.message.refusal || choice.message.tool_calls?.length || choice.finish_reason === "content_filter") throw new AiProviderError("AI provider could not complete this request. Try adjusting the project goal.");
+  if ([choice.finish_reason, choice.native_finish_reason].some(reason => ["length", "max_tokens", "max_output_tokens"].includes(reason ?? ""))) return { hint: "The response was truncated. Return a shorter complete JSON object." };
+  if (choice.finish_reason && choice.finish_reason !== "stop") throw new AiProviderError("AI provider did not return a completed text response.");
   const content = typeof choice.message.content === "string" ? choice.message.content : choice.message.content?.map(part => part.text).join("");
   if (!content || content.length > 200_000) return { hint: "Return one complete JSON object within the requested size limits." };
   const trimmed = content.trim();
@@ -45,7 +51,7 @@ const mock: AiProvider = {
   name: "mock",
   model: "deterministic-demo",
   async generate(kind, goal) {
-    const subject = goal.replace(/[.!?]+$/, "");
+    const subject = goal.replace(/[.!?]+$/, "").slice(0, 1600);
     const byKind: Record<AgentKind, AgentResult> = {
       FOUNDER: { summary: `Demo strategy for: ${subject}. Validate a narrow customer problem before building.`, tasks: [{ title: "Interview five prospective customers", description: "Record the problem, current workaround, and willingness to pay." }, { title: "Define the MVP success criterion", description: "Choose one measurable activation event and a target date." }], reports: [{ title: "Initial strategy", kind: "strategy", content: `Goal: ${goal}\n\nHypothesis: a focused product can serve an identifiable niche.\n\nMilestones: discovery, prototype, pilot, launch. These are demo suggestions, not verified market facts.` }], metrics: [{ key: "discovery_interviews", label: "Discovery interviews", value: 0, unit: "" }] },
       RESEARCH: { summary: "Demo research outline created. Market claims require independent verification.", tasks: [{ title: "Verify three competitor offerings", description: "Compare pricing, target customer, and differentiators using primary sources." }], reports: [{ title: "Market research outline", kind: "research", content: `Goal: ${goal}\n\nCustomer profile hypothesis: small teams with a repeated, costly workflow.\n\nCompetitor research checklist: direct alternatives, indirect alternatives, pricing, positioning.\n\nOpportunity: interview customers before making market-size claims. Demo content; no live web research was performed.` }], metrics: [] },
@@ -62,8 +68,8 @@ export function provider(): AiProvider {
   let env: ReturnType<typeof serverEnv>;
   try { env = serverEnv(); }
   catch { throw new AiProviderError("Server AI configuration is incomplete."); }
+  if (env.DEMO_MODE === "true") return mock;
   if (!env.OPENAI_API_KEY) {
-    if (env.DEMO_MODE === "true") return mock;
     throw new AiProviderError("AI is not configured. Set OPENAI_API_KEY or enable DEMO_MODE.");
   }
   return {
@@ -80,12 +86,22 @@ export function provider(): AiProvider {
           method: "POST",
           headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
           body: JSON.stringify({ model: env.OPENAI_MODEL, response_format: { type: "json_object" }, messages }),
-          signal: AbortSignal.timeout(60_000),
+          signal: AbortSignal.timeout(AGENT_REQUEST_TIMEOUT_MS),
+          cache: "no-store",
+          redirect: "error",
         }); } catch { throw new AiProviderError("AI provider request timed out or could not connect."); }
         if (response.status === 401 || response.status === 403) throw new AiProviderError("AI provider rejected its credentials or model access.");
         if (response.status === 429) throw new AiProviderError("AI provider rate limit reached. Try again later.");
+        if ([502, 503, 504].includes(response.status) && attempt === 0) {
+          await response.body?.cancel().catch(() => {});
+          continue;
+        }
         if (!response.ok) throw new AiProviderError(`AI provider request failed (${response.status}).`);
-        const payload = await response.json().catch(() => null) as unknown;
+        let payload: unknown;
+        try { payload = await readProviderJson(response); }
+        catch (error) {
+          throw new AiProviderError(error instanceof ProviderResponseError && error.code === "TOO_LARGE" ? "AI provider response exceeded its size limit." : "AI provider response timed out or could not be read.");
+        }
         const parsed = parseStructuredResult(payload);
         if (parsed.result) return parsed.result;
         messages.push({ role: "user", content: `The previous response did not satisfy the required JSON contract. ${parsed.hint} Regenerate the complete result from scratch. Return JSON only.` });

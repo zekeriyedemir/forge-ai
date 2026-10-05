@@ -14,20 +14,22 @@ The GitHub OAuth scope includes `repo` for public/private repository code read a
 
 ## AI and demo behavior
 
-Set `OPENAI_API_KEY` for a live provider, with `OPENAI_BASE_URL` (default `https://api.openai.com/v1`) and `OPENAI_MODEL` for a Chat Completions JSON-mode-capable model. These values are server-only. With no AI key, set `DEMO_MODE=true` for deterministic demo output. Demo mode grants anonymous visitors access to one shared account, so use only a dedicated disposable database. In private production deployments set `DEMO_MODE=false`; missing AI credentials then produce a clear workflow error.
+Set `OPENAI_API_KEY` for a live provider, with `OPENAI_BASE_URL` (default `https://api.openai.com/v1`) and `OPENAI_MODEL` for a Chat Completions JSON-mode-capable model. These values are server-only. Keep `DEMO_MODE=false` for live production use. The public `/demo` is a read-only sample with no database, account, or API requests. `DEMO_MODE=true` always selects deterministic sample AI, even when an API key is set; anonymous access to its shared disposable account is allowed only in development/test, never in production. Missing live credentials produce a safe failed workflow.
 Developer repository proposals also use server-only `DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS` (default `8192`, valid `1024`–`32768`). Set it to a value supported by the chosen model and large enough for complete proposed files. A model with a small context/output window can still fail safely with `CONTEXT_TOO_LARGE` or `TRUNCATED`; choose a smaller task or a more capable model.
 
-Live Research additionally requires server-only `BRAVE_SEARCH_API_KEY`. With `DEMO_MODE=false`, missing Brave or AI credentials make the Research step fail with **NOT CONFIGURED**; Forge never substitutes fabricated findings. The workflow route requests a 120-second maximum duration for the bounded search, page, and synthesis sequence. Set a hosting duration that supports this path or use a host that does. Apply migration `20260917190000_live_research` before running the updated app. See [Research](research.md) for manual verification and provider status labels.
+Live Research additionally requires either a SearXNG instance (`RESEARCH_PROVIDER=searxng`, `RESEARCH_SEARXNG_BASE_URL`) with JSON search enabled, or server-only `BRAVE_SEARCH_API_KEY` (`RESEARCH_PROVIDER=brave`). In `auto` mode SearXNG is preferred when configured. With `DEMO_MODE=false`, missing search or AI configuration fails the Research step; Forge never substitutes fabricated findings. The workflow route requests a 120-second maximum duration for the bounded search, page, and synthesis sequence. Set a hosting duration that supports this path or use a host that does. Apply migration `20260917190000_live_research` before running the updated app. See [Research](research.md) for manual verification and provider status labels.
 
 The Approval Center declares a 120-second Server Action duration for repository inspection and live proposal/correction generation. The hosting plan must permit that duration; if it enforces a lower cap, use a supported plan or run the workflow on a host with a sufficient limit. A timed-out request must be checked against the persisted approval/PR state before retrying.
 
 ## Vercel release steps
 
+This repository is not deployed yet. No live deployment URL is claimed. After the first release, add the actual public URL to the README. Keep the `/demo` route public so reviewers can inspect the product without connecting GitHub.
+
 1. Import the GitHub repository into Vercel as a Next.js project. Use Node.js 22 or newer. `npm ci` runs `prisma generate` through `postinstall`, and `npm run build` builds with webpack.
-2. In Vercel project settings, set `DATABASE_URL`, `DIRECT_URL`, `AUTH_SECRET`, `AUTH_GITHUB_ID`, `AUTH_GITHUB_SECRET`, `DEMO_MODE`, and, for live AI, `OPENAI_API_KEY`. Add `BRAVE_SEARCH_API_KEY` for live research. Add `OPENAI_BASE_URL` and `OPENAI_MODEL` only when overriding the defaults. Configure environment-specific values separately for Production and Preview.
+2. In Vercel project settings, set `DATABASE_URL`, `DIRECT_URL`, `AUTH_SECRET`, `AUTH_GITHUB_ID`, `AUTH_GITHUB_SECRET`, `DEMO_MODE`, and, for live AI, `OPENAI_API_KEY`. Configure SearXNG or add `BRAVE_SEARCH_API_KEY` for live research. Add `OPENAI_BASE_URL` and `OPENAI_MODEL` only when overriding the defaults. Configure environment-specific values separately for Production and Preview.
 3. Configure the production GitHub OAuth callback for the actual Vercel domain or custom domain. Avoid enabling GitHub login on changing preview URLs unless their callbacks are explicitly registered.
 4. Run `npm run db:migrate` against the production Neon database from a trusted shell or deployment job with `DIRECT_URL` set. Deploy the matching commit only after migration succeeds.
-5. Verify `/login`, GitHub sign-in, project creation, a demo or live workflow, tasks, reports, repository linking, and the Approval Center on the deployed domain.
+5. Verify `/login`, GitHub sign-in, project creation, a live workflow (or a deterministic workflow with an authenticated session), tasks, reports, repository linking, and the Approval Center on the deployed domain.
 
 ## Manual Developer coding and CI correction test
 
@@ -43,6 +45,19 @@ Use a disposable repository with a small real app, at most 500 tree entries, a `
 
 Forge validates the proposal format and allowed files before writing, but it cannot run the target repository's tests on Vercel. The remote GitHub check is the merge gate. A repository without checks can receive a branch and PR but cannot be merged through Forge. Large repositories, sensitive paths, binary files, credential-like content, and changes to existing files Forge could not inspect are intentionally outside this V1 execution path.
 
-The Dockerfile also supports self-hosting. Pass the same runtime variables, set `AUTH_TRUST_HOST=true` behind a trusted proxy, and run migrations before starting the container. CI runs lint, typecheck, unit tests, and a production build; Playwright remains a manual database/browser check.
+## Docker self-hosting
+
+The multi-stage Dockerfile uses Next.js standalone output, includes Prisma's OpenSSL runtime, and runs as an unprivileged user. Secrets and development artifacts are excluded from the build context.
+
+```bash
+docker build -t forge-ai .
+# Apply migrations from the source checkout before starting this version.
+npm run db:migrate
+docker run --rm -p 3000:3000 --env-file .env -e AUTH_TRUST_HOST=true forge-ai
+```
+
+Use a database hostname reachable from inside the container (`localhost` points to the container itself). Set `AUTH_TRUST_HOST=true` only behind your own trusted proxy. Migrations run from the source checkout or a release job; the minimal runtime image does not include Prisma CLI.
+
+CI provisions a disposable PostgreSQL service and runs migrations, lint, typecheck, unit/integration tests, the production build, and Playwright browser checks.
 
 References: [Neon connection pooling](https://neon.com/docs/connect/connection-pooling), [Prisma v6 connection URLs](https://www.prisma.io/docs/orm/v6/reference/connection-urls), [Auth.js deployment](https://authjs.dev/getting-started/deployment), [GitHub OAuth app setup](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app), [GitHub check runs](https://docs.github.com/en/rest/checks/runs), [workflow jobs](https://docs.github.com/en/rest/actions/workflow-jobs), [job logs](https://docs.github.com/en/rest/actions/workflow-jobs#download-job-logs-for-a-workflow-run), [OpenAI Chat Completions JSON mode](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create), [OpenRouter Chat Completions parameters](https://openrouter.ai/docs/api/api-reference/chat/send-chat-completion-request), [OpenRouter model output limits](https://openrouter.ai/docs/api/api-reference/models/get-model), and [Vercel Prisma build guidance](https://vercel.com/kb/guide/nextjs-prisma-postgres).

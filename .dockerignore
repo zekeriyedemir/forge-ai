@@ -4,3 +4,9 @@ node_modules
 .env*
 !/.env.example
 forge-ai-app
+test-results
+playwright-report
+coverage
+.codex
+.agents
+*.tsbuildinfo

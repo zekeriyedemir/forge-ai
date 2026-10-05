@@ -1,13 +1,13 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { currentUserId, projectForOwner } from "@/lib/access";
+import { authenticatedUserId, projectForOwner } from "@/lib/access";
 import { GitHubIntegrationError, listRepositories } from "@/lib/github";
 import { db } from "@/lib/db";
 
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   if (!z.uuid().safeParse(id).success) return NextResponse.json({ error: "Invalid project ID" }, { status: 400 });
-  const userId = await currentUserId();
+  const userId = await authenticatedUserId();
   if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const project = await projectForOwner(id, userId);
   if (!project) return NextResponse.json({ error: "Not found" }, { status: 404 });
@@ -16,8 +16,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   try {
     const repo = (await listRepositories(userId)).find(item => item.id === parsed.data.repositoryId);
     if (!repo) return NextResponse.json({ error: "Repository not available" }, { status: 404 });
-    await db.gitHubRepository.upsert({ where: { projectId: id }, create: { projectId: id, githubId: BigInt(repo.id), fullName: repo.full_name, url: repo.html_url, defaultBranch: repo.default_branch }, update: { githubId: BigInt(repo.id), fullName: repo.full_name, url: repo.html_url, defaultBranch: repo.default_branch } });
-    await db.integration.upsert({ where: { workspaceId_type: { workspaceId: project.workspaceId, type: "GITHUB" } }, create: { workspaceId: project.workspaceId, type: "GITHUB" }, update: { status: "CONNECTED" } });
+    const repository = { githubId: BigInt(repo.id), fullName: repo.full_name, url: repo.html_url, defaultBranch: repo.default_branch };
+    await db.$transaction(async tx => {
+      await tx.project.update({ where: { id, workspace: { members: { some: { userId, role: "OWNER" } } } }, data: { repositories: { upsert: { where: { projectId: id }, create: repository, update: repository } } } });
+      await tx.integration.upsert({ where: { workspaceId_type: { workspaceId: project.workspaceId, type: "GITHUB" } }, create: { workspaceId: project.workspaceId, type: "GITHUB" }, update: { status: "CONNECTED" } });
+    });
     return NextResponse.json({ ok: true });
   } catch (error) { return NextResponse.json({ error: error instanceof GitHubIntegrationError ? error.message : "Could not link the GitHub repository. Try again." }, { status: 502 }); }
 }

@@ -1,38 +1,141 @@
 # Forge AI
 
-Forge AI is a business-building command center. A founder enters a goal, and four coordinated agents create strategy, evidence-backed research when configured, an MVP plan, tasks, reports, and progress metrics. Forge does not claim to autonomously create revenue.
+**AI-powered development workspace connected to your GitHub repositories.**
+
+Forge AI brings project goals, GitHub repositories, and AI-assisted planning into one workspace. Create a project, run a validated workflow, and turn its results into tasks and reports. Repository changes stay behind explicit human approvals.
+
+[Explore the code](https://github.com/zekeriyedemir/forge-ai) · [Deployment guide](docs/deployment.md) · [Architecture](docs/architecture.md)
+
+## Live demo
+
+Not deployed yet. Run locally using the steps below, or deploy to Vercel with Neon using the [release guide](docs/deployment.md).
+
+The public **`/demo`** page is a read-only, interactive sample: no account, database, API credits, or repository access required. The real workspace uses GitHub sign-in.
 
 ## Screenshots
 
-Screenshots can be captured from the running landing page and project dashboard. None are included yet.
+![Forge AI landing page](docs/screenshots/landing.png)
+![Forge AI project workspace](docs/screenshots/project.png)
 
-## Stack and architecture
+Screenshots show the application running locally with clearly labeled sample data.
 
-Next.js App Router, React, strict TypeScript, Tailwind CSS, PostgreSQL, Prisma, Auth.js with GitHub OAuth, Zod, Vitest, and Playwright. See [architecture](docs/architecture.md), [agents](docs/agents.md), and [database](docs/database.md).
+## What Forge AI does
 
-## Local setup
+1. **Connect GitHub** and browse the repositories your account can access.
+2. **Create a project** with a clear goal, then link its repository in Integrations.
+3. **Run a workflow:** strategy → research → refined strategy → development plan → progress review.
+4. **Review the output:** persisted tasks, reports, metrics, research evidence, and activity.
+5. **Optionally propose a code change.** Inspect the proposed files, approve a branch and pull request, review CI, and approve a merge separately.
 
-1. Install Node.js 22+ (`.nvmrc`) and PostgreSQL 16. If Docker is available, `docker compose up -d db` starts a disposable local database.
-2. Run `cp .env.example .env`. Replace `AUTH_SECRET` with a random value of at least 32 characters (for example, `openssl rand -base64 33`). Keep `.env` private. Prisma CLI and the seed script read `.env`; Next.js reads it too.
-3. Set both `DATABASE_URL` and `DIRECT_URL` in `.env` to the local PostgreSQL URL. They may be identical locally. Run `npm ci` (which generates Prisma Client), then `npm run db:migrate`. Optional: `npm run db:seed` adds an example project.
-4. Run `npm run dev` and open http://localhost:3000.
+## Key features
 
-For a credential-free demo, set `DEMO_MODE=true` and leave `OPENAI_API_KEY` empty. Demo mode uses a shared, disposable account and deterministic, labeled output; it does not perform live market research. Keep it off for private production data. If `DEMO_MODE=false` and no AI key is set, workflows fail with a configuration message instead of silently using mock output.
+- GitHub OAuth, database-backed sessions, private workspaces, and owner-only project mutations.
+- Searchable repository selection and server-side GitHub API integration.
+- Five-step workflows with bounded AI calls, Zod-validated results, safe failures, and transactional persistence.
+- Live research through SearXNG or Brave, with bounded public-page retrieval and exact-quote validation.
+- Human-approved repository changes, CI checks, correction proposals, and stale-head protection.
+- Responsive interface with pending, empty, error, and success states; typed-name project deletion.
+- Credential-free sample experience and deterministic local development mode.
 
-For live AI, set `OPENAI_API_KEY` and choose an OpenAI-compatible `OPENAI_BASE_URL` and `OPENAI_MODEL` that support Chat Completions JSON mode. The key stays on the server. Forge validates each complete result with Zod, retries malformed structured output once, and records a failed run if it remains invalid. No real AI call is needed to run tests. To smoke-test your own provider, use a disposable project, start a workflow, and inspect its run status, events, tasks, reports, and metric keys; automated tests use fake responses.
+## Architecture
 
-For **live research**, also set server-only `BRAVE_SEARCH_API_KEY` from [Brave Search API](https://api-dashboard.search.brave.com/documentation/services/web-search) and use `DEMO_MODE=false`. The Research step makes up to five search requests, retrieves at most six public HTML pages, validates exact source quotes, and saves findings under **Project → Research**. The later Founder step consumes findings from that workflow. Without both the search and AI credentials, live research is **NOT CONFIGURED** and fails visibly; demo mode keeps its labeled **MOCKED** outline with no claimed live evidence. See [Research](docs/research.md) for configuration, limits, and manual verification.
+```mermaid
+flowchart LR
+  UI[Next.js / React] --> Server[Server Components, Actions & API routes]
+  Server --> Auth[Auth.js / GitHub OAuth]
+  Server --> DB[(PostgreSQL / Neon · Prisma)]
+  Server --> GitHub[GitHub API]
+  Server --> Runtime[Workflow runtime]
+  Runtime --> AI[OpenAI-compatible provider]
+  Runtime --> Search[SearXNG or Brave]
+  Runtime --> Validation[Zod validation]
+  Validation --> DB
+```
 
-GitHub login requires `AUTH_GITHUB_ID` and `AUTH_GITHUB_SECRET` from a GitHub OAuth app. Add `http://localhost:3000/api/auth/callback/github` as its local callback. Auth.js v5 infers the normal host, so `AUTH_URL` is usually unnecessary. After signing in, open **Dashboard → Integrations** to see your authorized public and private repositories even before creating a project. Create a project to link one. A demo-only session cannot access GitHub repositories. Signed-in project owners can permanently delete a project under **Project → Settings** by typing its exact name; deletion also removes its goals, workflows, tasks, reports, metrics, activity, and repository link. See [deployment](docs/deployment.md) for production callback setup.
+One Next.js application handles the frontend and backend. The browser advances one persisted workflow step per request; this is not a background job service. Database claims prevent duplicate execution, and generated content commits atomically with run completion. See [architecture](docs/architecture.md) and [developer execution](docs/agents.md#developer-repository-execution) for limits and recovery behavior.
 
-To let the Developer Agent work on a linked repository, configure a live AI provider, a GitHub OAuth login with `repo` access, and at least one GitHub CI check. Run the existing workflow to create tasks, then open **Project → Approval Center** and select a task. Review inspected paths, complete CREATE/UPDATE files, expected CI results, and risks before approving implementation. Forge opens a real feature branch, commit, and PR. Use **Refresh CI** to observe its current head. If that branch changed outside Forge, CI and merge are blocked until you review the exact GitHub head and explicitly approve an **ADOPT** request; adoption makes no GitHub write and creates a fresh merge approval. After a failed check, **Analyze failure & propose correction** creates a separate fix approval; only an approved correction pushes another commit to the same branch and PR. The correction loop is limited to three rounds. Merge still needs a separate approval and passing GitHub checks. Forge never executes model-generated shell commands. See [Developer execution](docs/agents.md#developer-repository-execution) for limits, recovery, and the disposable-repository manual test.
+## Tech stack
 
-Developer proposals request a separate completion budget of `8192` tokens by default. Set `DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS` between `1024` and `32768` to fit your model's output and context limits. The model must return complete proposed file contents; a truncated response is rejected with a specific error and never creates a GitHub change. See [Developer execution](docs/agents.md#developer-repository-execution) for troubleshooting.
+Next.js 16 · React 19 · TypeScript · Tailwind CSS 4 · PostgreSQL / Neon · Prisma 6 · Auth.js · GitHub REST API · OpenAI-compatible Chat Completions · Zod · Vitest · Playwright · Docker · GitHub Actions · Vercel
 
-## Validation and deployment
+## Engineering highlights
 
-Run `npm run lint`, `npm run typecheck`, `npm test`, and `npm run build`. Playwright demo tests (`npm run test:e2e`) require a migrated local database and Chromium (`npx playwright install chromium`); anonymous protection checks (`npm run test:e2e:auth`) need a browser but no database queries. To use an installed Chrome instead of Playwright's Chromium, set `PLAYWRIGHT_BROWSER_CHANNEL=chrome`. GitHub Actions runs lint, typecheck, unit tests, and the production build. See [security](docs/security.md), [deployment](docs/deployment.md), and [roadmap](docs/roadmap.md).
+Authorization is enforced on the server and repeated inside critical database mutations. A failed structured response cannot leave partially saved tasks or reports. Workflow start uses serializable transactions, execution uses database claims, and provider responses have time and size limits. Integration tests exercise real PostgreSQL persistence and cascading deletion; browser tests cover project creation, workflow results, ownership boundaries, and deletion.
 
-The opt-in agent output integration test uses a fake AI provider and temporary database records: `RUN_DB_INTEGRATION=true node --env-file=.env node_modules/vitest/vitest.mjs run tests/integration/agent-output.test.ts`. It makes no paid AI request; run it only against a database where creating and deleting a temporary project is acceptable.
+## Running locally
 
-The optional cascade integration test creates and removes temporary records in the configured database. Run it only against a database where that is acceptable: `RUN_DB_INTEGRATION=true node --env-file=.env node_modules/vitest/vitest.mjs run tests/integration/project-delete.test.ts`.
+Use **Node.js 22+** and PostgreSQL 16. Docker is optional for the application, but provides a convenient local database.
+
+```bash
+git clone https://github.com/zekeriyedemir/forge-ai.git
+cd forge-ai
+cp .env.example .env
+npm ci
+docker compose up -d db
+# Edit .env: set AUTH_SECRET; use the local database URLs provided.
+# For a disposable local workspace without OAuth, set DEMO_MODE="true".
+npm run db:migrate
+npm run dev
+```
+
+Open [localhost:3000](http://localhost:3000). `/demo` works without configuration; `/dashboard` needs GitHub sign-in or local demo mode. Generate `AUTH_SECRET` with `openssl rand -base64 33`. Optional: `npm run db:seed` adds an example project to the local demo workspace.
+
+For real sign-in, register a [GitHub OAuth app](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app) with callback `http://localhost:3000/api/auth/callback/github`. Set the GitHub variables below and `DEMO_MODE=false`. The requested `repo` scope includes private repository access; use a disposable repository when evaluating code changes.
+
+## Environment variables
+
+Keep values in ignored `.env` files or your host's secret settings. See [.env.example](.env.example).
+
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | Runtime PostgreSQL connection; use Neon's pooled URL in production. |
+| `DIRECT_URL` | Direct PostgreSQL connection for Prisma migrations. |
+| `AUTH_SECRET` | Random session secret of at least 32 characters. |
+| `AUTH_GITHUB_ID`, `AUTH_GITHUB_SECRET` | GitHub OAuth application credentials. |
+| `AUTH_URL` | Optional Auth.js URL override; normally inferred. |
+| `AUTH_TRUST_HOST` | Set `true` only behind a trusted self-hosted proxy; inferred on Vercel. |
+| `DEMO_MODE` | Default `false`; `true` selects deterministic AI and enables a shared local development account. Production never grants anonymous workspace access. |
+| `OPENAI_API_KEY` | Server-only credential for live AI; not needed by `/demo` or deterministic mode. |
+| `OPENAI_BASE_URL` | Optional compatible API base; defaults to `https://api.openai.com/v1`. |
+| `OPENAI_MODEL` | JSON-mode-capable model; defaults to `gpt-4o-mini`. |
+| `RESEARCH_PROVIDER` | `auto`, `searxng`, or `brave`. Auto prefers configured SearXNG. |
+| `RESEARCH_SEARXNG_BASE_URL` | SearXNG instance with JSON search enabled. |
+| `BRAVE_SEARCH_API_KEY` | Optional alternative search credential. |
+| `DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS` | Proposal output budget, 1,024–32,768; default 8,192. |
+
+Live workflows require AI **and** a research provider. Missing configuration produces a safe failed run, never fabricated evidence. Demo mode always uses sample output, even if a live key is present. All provider credentials stay on the server.
+
+## Testing
+
+```bash
+npm run lint
+npm run typecheck
+npm test
+npm run build
+npx playwright install chromium
+npm run test:e2e:auth
+# Against a migrated disposable database:
+RUN_DB_INTEGRATION=true node --env-file=.env node_modules/vitest/vitest.mjs run tests/integration
+node --env-file=.env node_modules/@playwright/test/cli.js test
+```
+
+Unit tests mock external providers and make no paid AI requests. Browser and integration tests create temporary database fixtures and clean them up. Set `PLAYWRIGHT_BROWSER_CHANNEL=chrome` to use installed Chrome. GitHub Actions provisions PostgreSQL and runs migrations, lint, types, tests, the production build, and browser checks.
+
+## Security
+
+Secrets are ignored by Git and excluded from the Docker build context. Session identities and project ownership are checked server-side; inaccessible project pages show a not-found boundary. Project deletion requires its exact name and cascades through project-owned records. GitHub writes and merges need separate approvals; Forge does not execute model-generated shell commands. Research retrieval rejects private network destinations. The public sample grants no database or integration access. See [security details](docs/security.md).
+
+## Project structure
+
+- `src/app/` — public pages, workspace, server actions, and API routes.
+- `src/components/` — shared UI and interactive controls.
+- `src/lib/` — authorization, GitHub, AI, research, and developer runtimes.
+- `prisma/` — schema, committed migrations, and optional sample seed.
+- `tests/` — browser and database integration tests; unit tests live beside source.
+- `docs/` — architecture, security, providers, deployment, and screenshots.
+
+## Future improvements
+
+- Durable background jobs for workflows that outlive a browser session.
+- A GitHub App with repository-scoped installation permissions.
+- Broader structured-output evaluations across supported AI models.

@@ -1,6 +1,8 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { authenticatedUserId, projectForOwner, projectForUser, requireUser } from "@/lib/access";
+import { ArrowLeft, FolderGit2 } from "lucide-react";
+import { ProjectNavigation } from "@/components/navigation";
 
 export default async function ProjectLayout({ children, params }: { children: React.ReactNode; params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -9,6 +11,5 @@ export default async function ProjectLayout({ children, params }: { children: Re
   if (!project) notFound();
   const signedInUserId = await authenticatedUserId();
   const canDelete = signedInUserId === userId && Boolean(await projectForOwner(id, userId));
-  const tabs = [{ slug: "", label: "Overview" }, { slug: "/agents", label: "Agents" }, { slug: "/research", label: "Research" }, { slug: "/tasks", label: "Tasks" }, { slug: "/reports", label: "Reports" }, { slug: "/metrics", label: "Metrics" }, { slug: "/activity", label: "Activity" }, ...(canDelete ? [{ slug: "/approvals", label: "Approval Center" }, { slug: "/settings", label: "Settings" }] : [])];
-  return <div className="mx-auto max-w-6xl"><Link href="/dashboard/projects" className="text-sm text-slate-500 hover:text-white">← All projects</Link><p className="mt-8 text-xs font-bold uppercase tracking-[.25em] text-orange-400">Forge / Project</p><h1 className="mt-3 text-4xl font-bold">{project.name}</h1><p className="mt-3 max-w-3xl text-slate-400">{project.description || "Your business command center"}</p><nav className="mt-9 flex gap-2 overflow-x-auto border-b border-white/10 pb-3" aria-label="Project navigation">{tabs.map(tab => <Link key={tab.slug} href={`/dashboard/projects/${id}${tab.slug}`} className="whitespace-nowrap rounded-lg px-4 py-2 text-sm text-slate-400 hover:bg-white/5 hover:text-white">{tab.label}</Link>)}</nav><div className="py-8">{children}</div></div>;
+  return <div className="mx-auto max-w-6xl"><Link href="/dashboard/projects" className="inline-flex items-center gap-1.5 text-xs text-slate-500 hover:text-indigo-600"><ArrowLeft size={14}/>All projects</Link><div className="mt-7 flex items-start gap-4"><span className="mt-1 hidden size-12 shrink-0 items-center justify-center rounded-2xl border border-[#e3def7] bg-[#eee9fb] text-[#8770c7] sm:flex"><FolderGit2 size={25}/></span><div className="min-w-0"><p className="eyebrow">Your project workspace</p><h1 className="page-title break-words">{project.name}</h1><p className="mt-3 max-w-3xl text-sm leading-6 text-slate-500">{project.description || "Give your ideas direction. Keep your next steps in view."}</p></div></div><ProjectNavigation id={id} canDelete={canDelete}/><div className="py-7">{children}</div></div>;
 }

@@ -14,30 +14,37 @@ export type SanitizedResearchError = {
   causeMessage: string;
 };
 
-const SAFE_ERROR_CODE = /^[A-Z][A-Z0-9_]{1,63}$/;
+const SAFE_ERROR_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ENOTFOUND", "EAI_AGAIN", "ETIMEDOUT", "ERR_NETWORK", "ERR_INVALID_IP_ADDRESS", "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "CERT_NOT_YET_VALID", "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_SOCKET"]);
+const SAFE_ERROR_NAMES = new Set(["Error", "TypeError", "RangeError", "DOMException", "AggregateError", "ResearchProviderError", "TimeoutError", "AbortError"]);
 
 function errorField(error: unknown, field: string): unknown {
   return error && typeof error === "object" ? Reflect.get(error, field) : undefined;
 }
 
 function safeErrorCode(value: unknown): string {
-  return typeof value === "string" && SAFE_ERROR_CODE.test(value) ? value : "";
+  return typeof value === "string" && SAFE_ERROR_CODES.has(value) ? value : "";
 }
 
 function safeErrorMessage(value: unknown): string {
   if (typeof value !== "string") return "";
-  return value.replace(/https?:\/\/[^\s"'<>]+/gi, "[url redacted]").replace(/\b(token|key|secret|password|authorization|credential)\s*[=:]\s*[^\s,;]+/gi, "$1=[redacted]").replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim().slice(0, 160);
+  // Keep useful classifications without echoing any provider-controlled text.
+  const known = ["content-encoding", "compressed", "socket hang up", "premature close", "aborted", "destroyed", "timed out", "timeout", "not html", "unavailable", "public addresses", "permitted public", "redirect", "readable text", "size limit", "exceeded", "socket reset", "request failed"];
+  return known.find(message => value.toLowerCase().includes(message)) ?? "unclassified error";
+}
+
+function safeErrorName(value: unknown): string {
+  return typeof value === "string" && SAFE_ERROR_NAMES.has(value) ? value : "Unknown";
 }
 
 export function sanitizeResearchError(error: unknown): SanitizedResearchError {
   const cause = errorField(error, "cause");
-  const constructorName = error && typeof error === "object" && error.constructor && typeof error.constructor.name === "string" ? error.constructor.name : "Unknown";
+  const constructorName = safeErrorName(error && typeof error === "object" ? error.constructor?.name : undefined);
   return {
     constructorName,
-    name: typeof errorField(error, "name") === "string" ? String(errorField(error, "name")) : "",
+    name: safeErrorName(errorField(error, "name")),
     code: safeErrorCode(errorField(error, "code")),
     message: safeErrorMessage(errorField(error, "message")),
-    causeName: typeof errorField(cause, "name") === "string" ? String(errorField(cause, "name")) : "",
+    causeName: safeErrorName(errorField(cause, "name")),
     causeCode: safeErrorCode(errorField(cause, "code")),
     causeMessage: safeErrorMessage(errorField(cause, "message")),
   };

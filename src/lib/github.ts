@@ -1,9 +1,18 @@
 import { db } from "@/lib/db";
+import { z } from "zod";
 
 export type GitHubRepo = { id: number; full_name: string; html_url: string; default_branch: string; private: boolean };
 export class GitHubIntegrationError extends Error {}
+const repositorySchema = z.object({
+  id: z.number().int().positive().safe(),
+  full_name: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
+  html_url: z.url().refine(value => { const url = URL.canParse(value) ? new URL(value) : null; return url?.origin === "https://github.com" && !url.username && !url.password; }),
+  default_branch: z.string().min(1).max(255),
+  private: z.boolean(),
+});
 
 export async function githubToken(userId: string) {
+  if (process.env.DEMO_MODE === "true") throw new GitHubIntegrationError("GitHub access is disabled in demo mode. Use an authenticated workspace with demo mode turned off.");
   const account = await db.account.findFirst({ where: { userId, provider: "github" }, select: { providerAccountId: true, access_token: true, refresh_token: true, expires_at: true } });
   if (!account?.access_token) return null;
   if (!account.expires_at || account.expires_at > Math.floor(Date.now() / 1000) + 60) return account.access_token;
@@ -17,6 +26,7 @@ export async function githubToken(userId: string) {
       headers: { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, grant_type: "refresh_token", refresh_token: account.refresh_token }),
       cache: "no-store",
+      signal: AbortSignal.timeout(20_000),
     });
   } catch { throw new GitHubIntegrationError("GitHub authorization renewal is temporarily unavailable. Try again later."); }
   if (!response.ok) throw new GitHubIntegrationError("GitHub authorization could not be renewed. Sign out and sign in again.");
@@ -31,10 +41,12 @@ export async function listRepositories(userId: string): Promise<GitHubRepo[]> {
   if (!token) throw new GitHubIntegrationError("GitHub access is missing. Sign out and sign in with GitHub again.");
   let response: Response;
   try {
-    response = await fetch("https://api.github.com/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member", { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" }, cache: "no-store" });
+    response = await fetch("https://api.github.com/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member", { headers: { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" }, cache: "no-store", signal: AbortSignal.timeout(20_000) });
   } catch { throw new GitHubIntegrationError("GitHub is temporarily unavailable. Try again."); }
   if (response.status === 401) throw new GitHubIntegrationError("GitHub authorization is no longer valid. Sign out and sign in again.");
   if (response.status === 403) throw new GitHubIntegrationError("GitHub denied repository access. Check your OAuth authorization or organization access.");
   if (!response.ok) throw new GitHubIntegrationError(`GitHub repository request failed (${response.status}).`);
-  return await response.json() as GitHubRepo[];
+  const parsed = z.array(repositorySchema).max(100).safeParse(await response.json().catch(() => null));
+  if (!parsed.success) throw new GitHubIntegrationError("GitHub returned incomplete repository details. Try again.");
+  return parsed.data;
 }

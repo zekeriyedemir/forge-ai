@@ -1,5 +1,9 @@
-# Roadmap
+# Future improvements
 
-V1 provides project and goal creation, persistent multi-agent execution, validated internal tools, reports, metrics, a polling-based command center, GitHub sign-in and repository association, demo mode, CI, Docker, and documentation.
+Forge AI focuses on a complete GitHub-connected development workflow: projects, validated AI planning, research evidence, human-approved changes, CI review, and safe deletion.
 
-Milestone 1 adds bounded live web research with saved citations and a Founder evidence handoff when Brave Search and the AI provider are configured. Later milestones address business orchestration, deployment, growth, sales, revenue, and a bounded cross-agent loop. A background worker, SSE event delivery, distributed rate limits, and richer output evaluations remain future infrastructure work.
+- Move long workflows to a durable background worker with resumable jobs.
+- Replace broad OAuth repository scope with a GitHub App and repository-specific permissions.
+- Expand structured-output evaluations across supported provider models.
+
+Payments, organizations, and autonomous revenue generation are outside the current portfolio scope.

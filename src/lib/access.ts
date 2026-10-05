@@ -1,6 +1,7 @@
 import { auth } from "@/auth";
 import { db } from "@/lib/db";
-import { redirect } from "next/navigation";
+import { Prisma } from "@prisma/client";
+import { notFound, redirect } from "next/navigation";
 
 export async function authenticatedUserId() {
   const session = await auth();
@@ -10,7 +11,8 @@ export async function authenticatedUserId() {
 export async function currentUserId() {
   const userId = await authenticatedUserId();
   if (userId) return userId;
-  if (process.env.DEMO_MODE === "true") {
+  // Shared sample data is a local development convenience, never a production identity.
+  if (process.env.DEMO_MODE === "true" && ["development", "test"].includes(process.env.NODE_ENV ?? "")) {
     const user = await db.user.upsert({ where: { email: "demo@forge.local" }, update: {}, create: { email: "demo@forge.local", name: "Demo Founder" } });
     return user.id;
   }
@@ -34,7 +36,7 @@ export async function projectForOwner(projectId: string, userId: string) {
 export async function requireProject(projectId: string) {
   const userId = await requireUser();
   const project = await projectForUser(projectId, userId);
-  if (!project) throw new Error("Project not found or access denied");
+  if (!project) notFound();
   return project;
 }
 
@@ -46,7 +48,17 @@ export async function requireProjectOwner(projectId: string) {
 }
 
 export async function workspaceForUser(userId: string) {
-  const member = await db.workspaceMember.findFirst({ where: { userId, role: "OWNER" }, include: { workspace: true } });
-  if (member) return member.workspace;
-  return db.workspace.create({ data: { name: "My Workspace", members: { create: { userId, role: "OWNER" } } } });
+  // Serializable isolation makes simultaneous first visits converge on one workspace.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await db.$transaction(async tx => {
+        const member = await tx.workspaceMember.findFirst({ where: { userId, role: "OWNER" }, include: { workspace: true } });
+        if (member) return member.workspace;
+        return tx.workspace.create({ data: { name: "My Workspace", members: { create: { userId, role: "OWNER" } } } });
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    } catch (error) {
+      if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== "P2034" || attempt === 2) throw error;
+    }
+  }
+  throw new Error("Your workspace could not be opened. Please try again.");
 }

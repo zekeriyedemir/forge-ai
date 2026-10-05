@@ -26,4 +26,10 @@ describe("structured agent result", () => {
     expect(resultSchema.safeParse({ summary: "Ready", tasks: [{ title: "x", description: "" }], reports: [], metrics: [] }).success).toBe(false);
     expect(resultSchema.safeParse({ summary: "Ready", tasks: [], reports: [], metrics: [{ key: "revenue", label: "Revenue", value: Infinity, unit: "" }] }).success).toBe(false);
   });
+
+  it("rejects whitespace-only display fields instead of saving blank content", () => {
+    expect(resultSchema.safeParse({ summary: "  ", tasks: [], reports: [], metrics: [] }).success).toBe(false);
+    expect(resultSchema.safeParse({ summary: "Ready", tasks: [{ title: "  ", description: "" }], reports: [], metrics: [] }).success).toBe(false);
+    expect(resultSchema.safeParse({ summary: "Ready", tasks: [], reports: [{ title: "Report", kind: "plan", content: "\n\t" }], metrics: [] }).success).toBe(false);
+  });
 });

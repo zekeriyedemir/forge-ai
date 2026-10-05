@@ -17,12 +17,12 @@ export const metricKeySchema = z.string().min(1).max(80)
     .toLowerCase())
   .pipe(z.string().min(1).max(64).regex(/^[a-z][a-z0-9_]*$/));
 
-export const taskSchema = z.object({ title: z.string().min(2).max(200), description: z.string().max(4000) });
-export const reportSchema = z.object({ title: z.string().min(2).max(200), kind: z.string().min(2).max(40), content: z.string().min(2).max(20000) });
-export const metricSchema = z.object({ key: metricKeySchema, label: z.string().min(2).max(80), value: z.number().finite(), unit: z.string().max(20) });
+export const taskSchema = z.object({ title: z.string().trim().min(2).max(200), description: z.string().trim().max(4000) });
+export const reportSchema = z.object({ title: z.string().trim().min(2).max(200), kind: z.string().trim().min(2).max(40), content: z.string().trim().min(2).max(20000) });
+export const metricSchema = z.object({ key: metricKeySchema, label: z.string().trim().min(2).max(80), value: z.number().finite(), unit: z.string().trim().max(20) });
 
 export const resultSchema = z.object({
-  summary: z.string().min(1).max(2000),
+  summary: z.string().trim().min(1).max(2000),
   tasks: z.array(taskSchema).max(8),
   reports: z.array(reportSchema).max(4),
   metrics: z.array(metricSchema).max(6),

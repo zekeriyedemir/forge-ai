@@ -10,7 +10,15 @@ describe("bounded evidence-backed research", () => {
   it("sanitizes nested errors without exposing URLs, credentials, or bodies", () => {
     const cause = Object.assign(new Error("socket reset https://example.org/private?token=secret"), { code: "ECONNRESET" });
     const error = Object.assign(new TypeError("request failed https://example.org/?api_key=secret response body hidden"), { code: "ERR_NETWORK", cause });
-    expect(sanitizeResearchError(error)).toEqual({ constructorName: "TypeError", name: "TypeError", code: "ERR_NETWORK", message: "request failed [url redacted] response body hidden", causeName: "Error", causeCode: "ECONNRESET", causeMessage: "socket reset [url redacted]" });
+    expect(sanitizeResearchError(error)).toEqual({ constructorName: "TypeError", name: "TypeError", code: "ERR_NETWORK", message: "request failed", causeName: "Error", causeCode: "ECONNRESET", causeMessage: "socket reset" });
+  });
+
+  it("never logs arbitrary error names, tokens, provider bodies, or uppercase secret-like codes", () => {
+    const error = Object.assign(new Error("Bearer private-value ghp_private-value postgres://private/db returned provider body"), { name: "private-name", code: "PRIVATE_API_TOKEN", cause: new Error("private-cause") });
+    const logged = JSON.stringify(sanitizeResearchError(error));
+    expect(logged).not.toContain("private");
+    expect(logged).not.toContain("PRIVATE_API_TOKEN");
+    expect(logged).toContain("unclassified error");
   });
 
   it("logs only a hostname and sanitized retrieval error fields", async () => {

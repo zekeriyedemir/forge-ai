@@ -1,5 +1,6 @@
 import { serverEnv } from "@/lib/env";
 import { z } from "zod";
+import { ProviderResponseError, readProviderJson } from "../agents/response";
 import { ciFixSchema, generatedProposalSchema, type CiFixProposal, type DeveloperProposal } from "./contracts";
 import { DeveloperProposalError, schemaFields } from "./diagnostics";
 
@@ -133,6 +134,7 @@ async function generate(task: string, context: Context, failure?: { summary: str
   let env: ReturnType<typeof serverEnv>;
   try { env = serverEnv(); }
   catch { throw new DeveloperProposalError("ai-provider", "CONFIGURATION", "The AI provider configuration is incomplete."); }
+  if (env.DEMO_MODE === "true") throw new DeveloperProposalError("ai-provider", "DEMO_MODE", "Repository proposals are unavailable in demo mode. Sign in to a configured workspace to continue.");
   if (!env.OPENAI_API_KEY) throw new DeveloperProposalError("ai-provider", "NOT_CONFIGURED", "Live AI is required for repository proposals.");
   const allowedExisting = new Set(context.files.map(file => file.path));
   const existing = new Set(context.paths);
@@ -146,19 +148,24 @@ async function generate(task: string, context: Context, failure?: { summary: str
     try {
       response = await fetch(`${(env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "")}/chat/completions`, {
         method: "POST", headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: env.OPENAI_MODEL, response_format: { type: "json_object" }, max_completion_tokens: env.DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS, messages }), signal: AbortSignal.timeout(60_000),
+        body: JSON.stringify({ model: env.OPENAI_MODEL, response_format: { type: "json_object" }, max_completion_tokens: env.DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS, messages }), signal: AbortSignal.timeout(40_000), cache: "no-store", redirect: "error",
       });
     } catch { throw new DeveloperProposalError("ai-provider", "UNAVAILABLE", "The AI provider could not connect or timed out."); }
     if (response.status === 401 || response.status === 403) throw new DeveloperProposalError("ai-provider", "ACCESS_DENIED", "The AI provider rejected its credentials or model access.");
     if (response.status === 429) throw new DeveloperProposalError("ai-provider", "RATE_LIMITED", "The AI provider rate limit was reached. Retry later.");
     if (response.status === 413) throw contextLimitFailure();
     if (response.status === 400 || response.status === 422) {
-      const errorBody: unknown = await response.json().catch(() => null);
+      const errorBody: unknown = await readProviderJson(response).catch(() => null);
       if (contextLimitError(errorBody)) throw contextLimitFailure();
       throw new DeveloperProposalError("ai-provider", "REQUEST_REJECTED", "The provider rejected the Developer proposal request. Check that the selected model supports JSON mode and DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS. No GitHub changes were made.");
     }
     if (!response.ok) throw new DeveloperProposalError("ai-provider", "HTTP_ERROR", `The AI provider request failed (HTTP ${response.status}).`);
-    const payload: unknown = await response.json().catch(() => null);
+    let payload: unknown;
+    try { payload = await readProviderJson(response); }
+    catch (error) {
+      if (error instanceof ProviderResponseError && error.code === "TOO_LARGE") throw new DeveloperProposalError("structured-output", "RESPONSE_TOO_LARGE", "The AI response exceeded its size limit. Choose a smaller task. No GitHub changes were made.");
+      throw new DeveloperProposalError("ai-provider", "UNREADABLE_RESPONSE", "The AI response timed out or could not be read. No GitHub changes were made.");
+    }
     if (contextLimitError(payload)) throw contextLimitFailure();
     if (object(payload)?.error != null) throw new DeveloperProposalError("ai-provider", "PROVIDER_ERROR", "The AI provider returned an error instead of a proposal. Check provider availability and model settings. No GitHub changes were made.");
     const completion = completionSchema.safeParse(payload);
