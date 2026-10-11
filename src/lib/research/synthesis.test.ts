@@ -52,10 +52,115 @@ describe("research synthesis trust boundary", () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it("fails immediately for output-limit truncation", async () => {
+  it("discards truncated output and regenerates once with a larger bounded budget", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(completion(JSON.stringify({ ...valid, summary: "This truncated response must never be used as the final analysis." }), "length"))
+      .mockResolvedValueOnce(completion(JSON.stringify(valid)));
+    vi.stubGlobal("fetch", fetcher);
+    expect(await synthesizeResearch("Build a support tool", sources)).toEqual(valid);
+    const requests = fetcher.mock.calls.map(([, init]) => JSON.parse(String(init?.body)));
+    expect(requests.map(body => body.max_completion_tokens)).toEqual([4096, 8192]);
+    expect(requests[1].messages.at(-1).content).toContain("fresh, concise JSON object");
+    expect(JSON.stringify(requests[1].messages)).not.toContain("This truncated response");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects repeated output-limit truncation after one retry", async () => {
     const fetcher = vi.fn(async () => completion("{", "length"));
     vi.stubGlobal("fetch", fetcher);
-    await expect(synthesizeResearch("Build a support tool", sources)).rejects.toThrow("completion budget");
+    await expect(synthesizeResearch("Build a support tool", sources)).rejects.toMatchObject({ code: "AI_INVALID_RESULT", message: expect.stringContaining("completion budget after one retry") });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("also rejects provider-native truncation and validates exact quotes on the retry", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json({ choices: [{ message: { content: JSON.stringify(valid) }, finish_reason: "stop", native_finish_reason: "max_tokens" }] }))
+      .mockResolvedValueOnce(completion(JSON.stringify({ ...valid, findings: [{ ...valid.findings[0], quote: "an invented source quotation" }] })));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(synthesizeResearch("Build a support tool", sources)).rejects.toMatchObject({ code: "AI_INVALID_RESULT" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([502, 503, 504])("recovers once from HTTP %s without reading its response body", async status => {
+    const canceled = vi.fn();
+    const errorBody = new ReadableStream({ cancel: canceled });
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(errorBody, { status }))
+      .mockResolvedValueOnce(completion(JSON.stringify(valid)));
+    vi.stubGlobal("fetch", fetcher);
+    expect(await synthesizeResearch("Build a support tool", sources)).toEqual(valid);
+    expect(canceled).toHaveBeenCalledOnce();
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([401, 403, 429, 400, 422])("does not retry non-transient HTTP %s", async status => {
+    const fetcher = vi.fn(async () => new Response("provider text with private credentials", { status }));
+    vi.stubGlobal("fetch", fetcher);
+    const code = status === 401 || status === 403 ? "AI_ACCESS_DENIED" : status === 429 ? "AI_RATE_LIMITED" : "AI_INVALID_RESULT";
+    const error = await synthesizeResearch("Build a support tool", sources).catch(error => error);
+    expect(error).toMatchObject({ code });
+    expect(error.message).not.toContain("private credentials");
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it("retries a network failure once with a fresh request timeout", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError("private connection details"))
+      .mockResolvedValueOnce(completion(JSON.stringify(valid)));
+    vi.stubGlobal("fetch", fetcher);
+    expect(await synthesizeResearch("Build a support tool", sources)).toEqual(valid);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    const firstSignal = fetcher.mock.calls[0][1]?.signal;
+    const secondSignal = fetcher.mock.calls[1][1]?.signal;
+    expect(firstSignal).toBeInstanceOf(AbortSignal);
+    expect(secondSignal).toBeInstanceOf(AbortSignal);
+    expect(secondSignal).not.toBe(firstSignal);
+  });
+
+  it("discards a broken response stream before retrying the entire analysis", async () => {
+    let reads = 0;
+    const brokenBody = new ReadableStream({ pull(controller) {
+      if (reads++ === 0) controller.enqueue(new TextEncoder().encode('{"choices":[{"message":'));
+      else controller.error(new TypeError("private stream details"));
+    } });
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response(brokenBody))
+      .mockResolvedValueOnce(completion(JSON.stringify(valid)));
+    vi.stubGlobal("fetch", fetcher);
+    expect(await synthesizeResearch("Build a support tool", sources)).toEqual(valid);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("classifies repeated response timeouts without exposing stream errors", async () => {
+    const fetcher = vi.fn(async () => new Response(new ReadableStream({ start(controller) {
+      controller.error(new DOMException("private upstream stream timed out", "AbortError"));
+    } })));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(synthesizeResearch("Build a support tool", sources)).rejects.toMatchObject({ code: "AI_TIMEOUT", message: "Research AI response timed out." });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("classifies persistent upstream failures after exactly two requests", async () => {
+    const fetcher = vi.fn(async () => new Response("private provider details", { status: 503 }));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(synthesizeResearch("Build a support tool", sources)).rejects.toMatchObject({ code: "AI_UNAVAILABLE", message: "Research AI request failed (503)." });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a single retry budget across transient errors and truncation", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(new Response("", { status: 503 }))
+      .mockResolvedValueOnce(completion(JSON.stringify(valid), "length"))
+      .mockResolvedValueOnce(completion(JSON.stringify(valid)));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(synthesizeResearch("Build a support tool", sources)).rejects.toMatchObject({ code: "AI_INVALID_RESULT" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a response that exceeds the body size limit", async () => {
+    const fetcher = vi.fn(async () => new Response("x".repeat(49 * 1024)));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(synthesizeResearch("Build a support tool", sources)).rejects.toMatchObject({ code: "AI_INVALID_RESULT", message: expect.stringContaining("size limit") });
     expect(fetcher).toHaveBeenCalledOnce();
   });
 
@@ -79,7 +184,8 @@ describe("research synthesis trust boundary", () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => {});
     const failure = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.stubGlobal("fetch", fetcher);
-    await expect(synthesizeResearch("Build a support tool", sources)).rejects.toThrow("Research AI request timed out.");
+    await expect(synthesizeResearch("Build a support tool", sources)).rejects.toMatchObject({ code: "AI_TIMEOUT", message: "Research AI request timed out." });
+    expect(fetcher).toHaveBeenCalledTimes(2);
     expect(RESEARCH_SYNTHESIS_TIMEOUT_MS).toBe(35_000);
     const logs = JSON.stringify([...info.mock.calls, ...failure.mock.calls]);
     expect(logs).not.toContain("secrets elsewhere");

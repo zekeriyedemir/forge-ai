@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { boundedHtmlBody, braveResearchProvider, extractHtmlText, pinnedLookup, pinnedRequestOptions, publicIpv4, publicResearchUrl, researchProviderConfigured, researchProviderFromEnv, retrievePublicPage, searxngResearchProvider } from "./provider";
+import { assertResearchAvailable, boundedHtmlBody, braveResearchProvider, extractHtmlText, pinnedLookup, pinnedRequestOptions, publicIpv4, publicResearchUrl, researchProviderConfigured, researchProviderFromEnv, retrievePublicPage, searxngResearchProvider } from "./provider";
 import type { lookup } from "node:dns/promises";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -139,7 +139,7 @@ describe("Brave Search adapter", () => {
 
   it("rejects oversized search responses", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("x".repeat(97 * 1024), { status: 200 })));
-    await expect(braveResearchProvider("fixture-key").search("query")).rejects.toThrow("size limit");
+    await expect(braveResearchProvider("fixture-key").search("query")).rejects.toMatchObject({ code: "RESEARCH_INVALID_RESPONSE", message: expect.stringContaining("size limit") });
   });
 });
 
@@ -165,5 +165,61 @@ describe("SearXNG adapter and provider selection", () => {
     expect(researchProviderConfigured({ RESEARCH_PROVIDER: "brave", BRAVE_SEARCH_API_KEY: "" })).toBe(false);
     expect(researchProviderConfigured({ RESEARCH_PROVIDER: "brave", BRAVE_SEARCH_API_KEY: "fixture-key" })).toBe(true);
     expect(() => researchProviderFromEnv({ RESEARCH_PROVIDER: "brave" })).toThrow("NOT CONFIGURED");
+  });
+
+  it("considers safe results after blocked or empty hits before applying the result cap", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ results: [
+      { url: "http://example.org/insecure" }, { url: "https://localhost/private" }, {},
+      ...Array.from({ length: 4 }, (_, index) => ({ title: `Source ${index}`, url: `https://example.org/${index}` })),
+    ] })));
+    expect(await searxngResearchProvider("http://localhost:8080").search("query")).toHaveLength(3);
+  });
+
+  it.each([
+    [403, "RESEARCH_ACCESS_DENIED"], [429, "RESEARCH_RATE_LIMITED"], [503, "RESEARCH_UNAVAILABLE"],
+  ])("classifies HTTP %s without exposing upstream error bodies", async (status, code) => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("secret provider response", { status })));
+    const error = await searxngResearchProvider("http://localhost:8080").search("query").catch(error => error);
+    expect(error).toMatchObject({ code });
+    expect(error.message).not.toContain("secret provider response");
+  });
+
+  it("classifies invalid configuration, empty envelopes, and connection failures", async () => {
+    expect(() => searxngResearchProvider("invalid URL")).toThrow(expect.objectContaining({ code: "RESEARCH_NOT_CONFIGURED" }));
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({})));
+    await expect(searxngResearchProvider("http://localhost:8080").search("query")).rejects.toMatchObject({ code: "RESEARCH_INVALID_RESPONSE" });
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("private upstream URL and credential"); }));
+    await expect(searxngResearchProvider("http://localhost:8080").search("query")).rejects.toMatchObject({ code: "RESEARCH_UNAVAILABLE" });
+  });
+
+  it("probes configured search access without requiring results or calling an AI provider", async () => {
+    const fetcher = vi.fn<typeof fetch>(async () => Response.json({ results: [] }));
+    vi.stubGlobal("fetch", fetcher);
+    await expect(assertResearchAvailable({ RESEARCH_PROVIDER: "searxng", RESEARCH_SEARXNG_BASE_URL: "http://localhost:8080" })).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(String(fetcher.mock.calls[0][0])).toContain("http://localhost:8080/search?");
+    await expect(assertResearchAvailable({ RESEARCH_PROVIDER: "brave" })).rejects.toMatchObject({ code: "RESEARCH_NOT_CONFIGURED" });
+    expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { RESEARCH_PROVIDER: "searxng", RESEARCH_SEARXNG_BASE_URL: "http://localhost:8080" },
+    { RESEARCH_PROVIDER: "brave", BRAVE_SEARCH_API_KEY: "fixture-key" },
+  ])("keeps a $RESEARCH_PROVIDER preflight body abort actionable after receiving headers", async env => {
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({ start(controller) { streamController = controller; } });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(stream, { status: 200, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetcher);
+    const failure = expect(assertResearchAvailable(env)).rejects.toMatchObject({
+      name: "ResearchProviderError",
+      code: "RESEARCH_UNAVAILABLE",
+      message: "Research search response timed out or could not be read.",
+    });
+    await Promise.resolve();
+    streamController.error(new DOMException("Private upstream host and credential", "AbortError"));
+
+    await failure;
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(stream.locked).toBe(false);
   });
 });

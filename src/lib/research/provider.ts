@@ -10,7 +10,7 @@ const MAX_SEARCH_BYTES = 96 * 1024;
 const MAX_PAGE_BYTES = 64 * 1024;
 const MAX_EXCERPT = 12_000;
 const braveSearchResponse = z.object({ web: z.object({ results: z.array(z.object({ title: z.string(), url: z.string(), description: z.string().nullish() })) }).optional() });
-const searxngSearchResponse = z.object({ results: z.array(z.object({ title: z.string().nullish(), url: z.string().nullish(), content: z.string().nullish(), snippet: z.string().nullish(), description: z.string().nullish() })).default([]) });
+const searxngSearchResponse = z.object({ results: z.array(z.object({ title: z.string().nullish(), url: z.string().nullish(), content: z.string().nullish(), snippet: z.string().nullish(), description: z.string().nullish() })) });
 
 export type SearchHit = { title: string; url: string; snippet: string };
 export type RetrievedPage = { url: string; title: string; excerpt: string; retrievedAt: Date };
@@ -20,7 +20,14 @@ export interface ResearchProvider {
   retrieve(url: string): Promise<RetrievedPage>;
 }
 export type ResearchProviderKind = "auto" | "searxng" | "brave";
-export class ResearchProviderError extends Error {}
+export type ResearchProviderErrorCode = "RESEARCH_NOT_CONFIGURED" | "RESEARCH_UNAVAILABLE" | "RESEARCH_ACCESS_DENIED" | "RESEARCH_RATE_LIMITED" | "RESEARCH_INVALID_RESPONSE" | "RESEARCH_NO_RESULTS" | "RESEARCH_NO_READABLE_SOURCES";
+
+export class ResearchProviderError extends Error {
+  constructor(message: string, readonly code: ResearchProviderErrorCode = "RESEARCH_UNAVAILABLE") {
+    super(message);
+    this.name = "ResearchProviderError";
+  }
+}
 
 export function researchProviderConfigured(env: Record<string, string | undefined> = process.env): boolean {
   const provider = (env.RESEARCH_PROVIDER ?? "auto").trim().toLowerCase() as ResearchProviderKind;
@@ -34,15 +41,21 @@ export function researchProviderFromEnv(env: Record<string, string | undefined> 
   const selected = provider === "auto" ? (env.RESEARCH_SEARXNG_BASE_URL?.trim() ? "searxng" : env.BRAVE_SEARCH_API_KEY?.trim() ? "brave" : "none") : provider;
   if (selected === "searxng") {
     const base = env.RESEARCH_SEARXNG_BASE_URL?.trim();
-    if (!base) throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set RESEARCH_PROVIDER=searxng and RESEARCH_SEARXNG_BASE_URL for local research.");
+    if (!base) throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set RESEARCH_PROVIDER=searxng and RESEARCH_SEARXNG_BASE_URL for local research.", "RESEARCH_NOT_CONFIGURED");
     return searxngResearchProvider(base);
   }
   if (selected === "brave") {
     const apiKey = env.BRAVE_SEARCH_API_KEY?.trim();
-    if (!apiKey) throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set BRAVE_SEARCH_API_KEY for Brave search.");
+    if (!apiKey) throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set BRAVE_SEARCH_API_KEY for Brave search.", "RESEARCH_NOT_CONFIGURED");
     return braveResearchProvider(apiKey);
   }
-  throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set RESEARCH_PROVIDER=searxng with RESEARCH_SEARXNG_BASE_URL or provide BRAVE_SEARCH_API_KEY.");
+  throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set RESEARCH_PROVIDER=searxng with RESEARCH_SEARXNG_BASE_URL or provide BRAVE_SEARCH_API_KEY.", "RESEARCH_NOT_CONFIGURED");
+}
+
+// Probe search access before a workflow spends AI tokens. An empty result set is
+// valid here: source coverage is assessed against the actual goal during research.
+export async function assertResearchAvailable(env: Record<string, string | undefined> = process.env): Promise<void> {
+  await researchProviderFromEnv(env).search("research service availability");
 }
 
 export function publicResearchUrl(value: string): URL {
@@ -88,7 +101,7 @@ export function extractHtmlText(html: string): { title: string; excerpt: string 
 
 async function boundedBody(response: Response, limit: number): Promise<string> {
   const reader = response.body?.getReader();
-  if (!reader) throw new ResearchProviderError("Research provider response was empty.");
+  if (!reader) throw new ResearchProviderError("Research provider response was empty.", "RESEARCH_INVALID_RESPONSE");
   const chunks: Uint8Array[] = [];
   let size = 0;
   try {
@@ -96,10 +109,16 @@ async function boundedBody(response: Response, limit: number): Promise<string> {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > limit) throw new ResearchProviderError("Research provider response exceeded its size limit.");
+      if (size > limit) throw new ResearchProviderError("Research provider response exceeded its size limit.", "RESEARCH_INVALID_RESPONSE");
       chunks.push(value);
     }
-  } finally { await reader.cancel().catch(() => {}); }
+  } catch (error) {
+    if (error instanceof ResearchProviderError) throw error;
+    throw new ResearchProviderError("Research search response timed out or could not be read.", "RESEARCH_UNAVAILABLE");
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
   return Buffer.concat(chunks).toString("utf8");
 }
 
@@ -176,8 +195,10 @@ export async function retrievePublicPage(value: string, io: { resolve: typeof lo
 }
 
 function normalizeSearxngEndpoint(value: string): URL {
-  const base = new URL(value.trim());
-  if (!/^https?:$/i.test(base.protocol)) throw new ResearchProviderError("Research provider URL must use HTTPS.");
+  let base: URL;
+  try { base = new URL(value.trim()); }
+  catch { throw new ResearchProviderError("Research provider URL is invalid.", "RESEARCH_NOT_CONFIGURED"); }
+  if (!/^https?:$/i.test(base.protocol)) throw new ResearchProviderError("Research provider URL must use HTTP or HTTPS.", "RESEARCH_NOT_CONFIGURED");
   const candidate = new URL(base.toString());
   if (/\/search$/i.test(candidate.pathname)) return candidate;
   candidate.pathname = `${candidate.pathname.replace(/\/+$/, "")}/search`;
@@ -186,7 +207,7 @@ function normalizeSearxngEndpoint(value: string): URL {
 
 export function searxngResearchProvider(baseUrl: string): ResearchProvider {
   const trimmed = baseUrl.trim();
-  if (!trimmed) throw new ResearchProviderError("Research provider is NOT CONFIGURED.");
+  if (!trimmed) throw new ResearchProviderError("Research provider is NOT CONFIGURED.", "RESEARCH_NOT_CONFIGURED");
   const endpoint = normalizeSearxngEndpoint(trimmed);
   return {
     name: "searxng",
@@ -197,29 +218,29 @@ export function searxngResearchProvider(baseUrl: string): ResearchProvider {
       url.searchParams.set("count", "3");
       url.searchParams.set("language", "en");
       const response = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "ForgeResearch/1.0" }, signal: AbortSignal.timeout(8_000), cache: "no-store", redirect: "error" }).catch(() => { throw new ResearchProviderError("Research search request timed out, redirected, or could not connect."); });
-      if (response.status === 401 || response.status === 403) throw new ResearchProviderError("Research provider rejected its credentials or access.");
-      if (response.status === 429) throw new ResearchProviderError("Research provider rate limit reached.");
+      if (response.status === 401 || response.status === 403) throw new ResearchProviderError("Research provider rejected its credentials or access.", "RESEARCH_ACCESS_DENIED");
+      if (response.status === 429) throw new ResearchProviderError("Research provider rate limit reached.", "RESEARCH_RATE_LIMITED");
       if (!response.ok) throw new ResearchProviderError(`Research search request failed (${response.status}).`);
       let json: unknown;
       const body = await boundedBody(response, MAX_SEARCH_BYTES);
       try { json = JSON.parse(body); }
-      catch { throw new ResearchProviderError("Research provider returned malformed search JSON."); }
+      catch { throw new ResearchProviderError("Research provider returned malformed search JSON.", "RESEARCH_INVALID_RESPONSE"); }
       const payload = searxngSearchResponse.safeParse(json);
-      if (!payload.success) throw new ResearchProviderError("Research provider returned an invalid search result.");
-      return payload.data.results.slice(0, 3).flatMap(hit => {
+      if (!payload.success) throw new ResearchProviderError("Research provider returned an invalid search result.", "RESEARCH_INVALID_RESPONSE");
+      return payload.data.results.flatMap(hit => {
         const safeUrl = hit.url?.trim();
         const snippetSource = hit.content ?? hit.snippet ?? hit.description ?? "";
         if (!safeUrl) return [];
         try { return [{ title: (hit.title ?? "Untitled result").slice(0, 200), url: publicResearchUrl(safeUrl).href, snippet: snippetSource.slice(0, 600) }]; }
         catch { return []; }
-      });
+      }).slice(0, 3);
     },
     retrieve: retrievePublicPage,
   };
 }
 
 export function braveResearchProvider(apiKey: string): ResearchProvider {
-  if (!apiKey.trim()) throw new ResearchProviderError("Research provider is NOT CONFIGURED.");
+  if (!apiKey.trim()) throw new ResearchProviderError("Research provider is NOT CONFIGURED.", "RESEARCH_NOT_CONFIGURED");
   return {
     name: "brave-search",
     async search(query) {
@@ -227,19 +248,19 @@ export function braveResearchProvider(apiKey: string): ResearchProvider {
       url.searchParams.set("q", query.slice(0, 220));
       url.searchParams.set("count", "3");
       const response = await fetch(url, { headers: { "X-Subscription-Token": apiKey, Accept: "application/json" }, signal: AbortSignal.timeout(8_000), cache: "no-store", redirect: "error" }).catch(() => { throw new ResearchProviderError("Research search request timed out, redirected, or could not connect."); });
-      if (response.status === 401 || response.status === 403) throw new ResearchProviderError("Research provider rejected its credentials.");
-      if (response.status === 429) throw new ResearchProviderError("Research provider rate limit reached.");
+      if (response.status === 401 || response.status === 403) throw new ResearchProviderError("Research provider rejected its credentials.", "RESEARCH_ACCESS_DENIED");
+      if (response.status === 429) throw new ResearchProviderError("Research provider rate limit reached.", "RESEARCH_RATE_LIMITED");
       if (!response.ok) throw new ResearchProviderError(`Research search request failed (${response.status}).`);
       let json: unknown;
       const body = await boundedBody(response, MAX_SEARCH_BYTES);
       try { json = JSON.parse(body); }
-      catch { throw new ResearchProviderError("Research provider returned malformed search JSON."); }
+      catch { throw new ResearchProviderError("Research provider returned malformed search JSON.", "RESEARCH_INVALID_RESPONSE"); }
       const payload = braveSearchResponse.safeParse(json);
-      if (!payload.success) throw new ResearchProviderError("Research provider returned an invalid search result.");
-      return (payload.data.web?.results ?? []).slice(0, 3).flatMap(hit => {
+      if (!payload.success) throw new ResearchProviderError("Research provider returned an invalid search result.", "RESEARCH_INVALID_RESPONSE");
+      return (payload.data.web?.results ?? []).flatMap(hit => {
         try { return [{ title: hit.title.slice(0, 200), url: publicResearchUrl(hit.url).href, snippet: (hit.description ?? "").slice(0, 600) }]; }
         catch { return []; }
-      });
+      }).slice(0, 3);
     },
     retrieve: retrievePublicPage,
   };

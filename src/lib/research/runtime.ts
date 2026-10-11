@@ -118,7 +118,7 @@ export async function collectResearch(goal: string, search: ResearchProvider, an
   if (!candidates.size) {
     const failure = searches.find(result => result.status === "rejected");
     if (failure?.status === "rejected" && failure.reason instanceof ResearchProviderError) throw failure.reason;
-    throw new ResearchProviderError("Research search returned no safe public results.");
+    throw new ResearchProviderError("Research search returned no safe public results.", "RESEARCH_NO_RESULTS");
   }
   const pages = await Promise.allSettled([...candidates.values()].map(async candidate => ({ ...await search.retrieve(candidate.url), query: candidate.query })));
   partialFailures += pages.filter(result => result.status === "rejected").length;
@@ -131,7 +131,7 @@ export async function collectResearch(goal: string, search: ResearchProvider, an
   const sources = [...uniquePages.values()];
   if (!sources.length) {
     const summary = retrievalFailureSummary(pages);
-    throw new ResearchProviderError(`Research found no retrievable public HTML pages. No findings were created.${summary ? ` Retrieval failures: ${summary}.` : ""}`);
+    throw new ResearchProviderError(`Research found no retrievable public HTML pages. No findings were created.${summary ? ` Retrieval failures: ${summary}.` : ""}`, "RESEARCH_NO_READABLE_SOURCES");
   }
   const analysis = validateEvidence(await analyze(goal, sources), sources);
   return { analysis, sources, queryCount: queries.length, provider: search.name, partialFailures };
@@ -148,6 +148,6 @@ export function researchReport(result: ResearchResult): string {
   result.sources.forEach((source, index) => lines.push(`[${index + 1}] ${source.title} — ${source.url} (retrieved ${source.retrievedAt.toISOString()})`));
   lines.push("", `Limitations: ${result.analysis.limitations}${result.partialFailures ? ` ${result.partialFailures} search/page request(s) failed.` : ""}`);
   const report = lines.join("\n");
-  if (report.length > 20_000) throw new ResearchProviderError("Research report exceeded its size limit. No partial report was saved.");
+  if (report.length > 20_000) throw new ResearchProviderError("Research report exceeded its size limit. No partial report was saved.", "RESEARCH_INVALID_RESPONSE");
   return report;
 }

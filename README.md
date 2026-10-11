@@ -103,7 +103,9 @@ Keep values in ignored `.env` files or your host's secret settings. See [.env.ex
 | `BRAVE_SEARCH_API_KEY` | Optional alternative search credential. |
 | `DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS` | Proposal output budget, 1,024–32,768; default 8,192. |
 
-Live workflows require AI **and** a research provider. Missing configuration produces a safe failed run, never fabricated evidence. Demo mode always uses sample output, even if a live key is present. All provider credentials stay on the server.
+Live workflows require AI **and** a research provider. For local search, start Docker and run `npm run research:start`, then set `RESEARCH_PROVIDER="searxng"` and `RESEARCH_SEARXNG_BASE_URL="http://localhost:8080"`. Restart Forge after changing `.env`. The command starts a private SearXNG container with JSON search enabled; it works with either the local database or Neon. See [research setup and troubleshooting](docs/research.md).
+
+Forge checks search connectivity before queuing a live workflow or calling AI. An unavailable search service shows an actionable error without consuming an attempt. Failures during execution identify the failing step and mark its dependent steps as skipped. Demo mode always uses sample output, even if a live key is present. All provider credentials stay on the server.
 
 ## Testing
 
