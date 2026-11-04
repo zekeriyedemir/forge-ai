@@ -1,8 +1,11 @@
 import { serverEnv } from "@/lib/env";
 import { z } from "zod";
 import { ProviderResponseError, readProviderJson } from "../agents/response";
+import { completionOptions } from "../agents/completion-options";
 import { ciFixSchema, generatedProposalSchema, type CiFixProposal, type DeveloperProposal } from "./contracts";
 import { DeveloperProposalError, schemaFields } from "./diagnostics";
+
+export const PROPOSAL_AI_TIMEOUT_MS = 90_000;
 
 const validExample = {
   task: "Add a status page",
@@ -130,41 +133,85 @@ function validFieldsForRepair(value: unknown): Record<string, string> {
 }
 
 type Context = { paths: string[]; files: { path: string; content: string }[] };
+function compactRetryFiles(context: Context) {
+  const files: Context["files"] = [];
+  let bytes = 0;
+  for (const file of context.files) {
+    const fileBytes = Buffer.byteLength(file.content);
+    if (files.length >= 2) break;
+    if (bytes + fileBytes > 12_000) continue;
+    files.push(file);
+    bytes += fileBytes;
+  }
+  return files;
+}
+
 async function generate(task: string, context: Context, failure?: { summary: string; diagnostics: string[] }): Promise<DeveloperProposal | CiFixProposal> {
   let env: ReturnType<typeof serverEnv>;
   try { env = serverEnv(); }
   catch { throw new DeveloperProposalError("ai-provider", "CONFIGURATION", "The AI provider configuration is incomplete."); }
   if (env.DEMO_MODE === "true") throw new DeveloperProposalError("ai-provider", "DEMO_MODE", "Repository proposals are unavailable in demo mode. Sign in to a configured workspace to continue.");
   if (!env.OPENAI_API_KEY) throw new DeveloperProposalError("ai-provider", "NOT_CONFIGURED", "Live AI is required for repository proposals.");
+  const maxFileContentCharacters = Math.min(64_000, Math.floor(env.DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS * 0.75));
+  const contract = (failure ? fixContract : proposalContract).replace(
+    "Total content across files must be at most 64000 characters.",
+    `Total content across files must be at most ${maxFileContentCharacters} characters so the complete JSON fits the configured output budget.`,
+  );
   const allowedExisting = new Set(context.files.map(file => file.path));
   const existing = new Set(context.paths);
   const messages = [
-    { role: "system", content: `You are Forge's Developer Agent.\n${failure ? fixContract : proposalContract}` },
-    { role: "user", content: JSON.stringify({ task, paths: context.paths, readableFiles: context.files, ...(failure ? { ciFailure: failure } : {}) }) },
+    { role: "system", content: `You are Forge's Developer Agent.\n${contract}` },
+    { role: "user", content: JSON.stringify({ task, readableFiles: context.files, ...(failure ? { ciFailure: failure } : {}) }) },
   ];
   let invalid = new DeveloperProposalError("structured-output", "INVALID_RESULT", "The model did not provide a valid complete proposal after one retry. No GitHub changes were made.");
+  const deadline = Date.now() + PROPOSAL_AI_TIMEOUT_MS;
   for (let attempt = 0; attempt < 2; attempt++) {
     let response: Response;
+    const remainingTimeout = Math.ceil(deadline - Date.now());
+    if (remainingTimeout <= 0) throw new DeveloperProposalError("ai-provider", "TIMEOUT", "The AI provider request timed out. No GitHub changes were made.");
+    const requestSignal = AbortSignal.timeout(remainingTimeout);
     try {
       response = await fetch(`${(env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "")}/chat/completions`, {
         method: "POST", headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: env.OPENAI_MODEL, response_format: { type: "json_object" }, max_completion_tokens: env.DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS, messages }), signal: AbortSignal.timeout(40_000), cache: "no-store", redirect: "error",
+        body: JSON.stringify({ model: env.OPENAI_MODEL, ...completionOptions(env, env.DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS), messages }), signal: requestSignal, cache: "no-store", redirect: "error",
       });
-    } catch { throw new DeveloperProposalError("ai-provider", "UNAVAILABLE", "The AI provider could not connect or timed out."); }
-    if (response.status === 401 || response.status === 403) throw new DeveloperProposalError("ai-provider", "ACCESS_DENIED", "The AI provider rejected its credentials or model access.");
-    if (response.status === 429) throw new DeveloperProposalError("ai-provider", "RATE_LIMITED", "The AI provider rate limit was reached. Retry later.");
-    if (response.status === 413) throw contextLimitFailure();
-    if (response.status === 400 || response.status === 422) {
-      const errorBody: unknown = await readProviderJson(response).catch(() => null);
-      if (contextLimitError(errorBody)) throw contextLimitFailure();
-      throw new DeveloperProposalError("ai-provider", "REQUEST_REJECTED", "The provider rejected the Developer proposal request. Check that the selected model supports JSON mode and DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS. No GitHub changes were made.");
+    } catch {
+      throw requestSignal.aborted
+        ? new DeveloperProposalError("ai-provider", "TIMEOUT", "The AI provider request timed out. No GitHub changes were made.")
+        : new DeveloperProposalError("ai-provider", "UNAVAILABLE", "The AI provider could not be reached. No GitHub changes were made.");
     }
-    if (!response.ok) throw new DeveloperProposalError("ai-provider", "HTTP_ERROR", `The AI provider request failed (HTTP ${response.status}).`);
+    if (response.status === 401 || response.status === 403) {
+      await response.body?.cancel().catch(() => {});
+      throw new DeveloperProposalError("ai-provider", "ACCESS_DENIED", "The AI provider rejected its credentials or model access.");
+    }
+    if (response.status === 429) {
+      await response.body?.cancel().catch(() => {});
+      throw new DeveloperProposalError("ai-provider", "RATE_LIMITED", "The AI provider rate limit was reached. Retry later.");
+    }
+    if (response.status === 413) {
+      await response.body?.cancel().catch(() => {});
+      throw contextLimitFailure();
+    }
+    if (response.status === 400 || response.status === 422) {
+      let errorBody: unknown = null;
+      try { errorBody = await readProviderJson(response); }
+      catch {
+        if (requestSignal.aborted) throw new DeveloperProposalError("ai-provider", "TIMEOUT", "The AI provider response timed out while being read. No GitHub changes were made.");
+      }
+      if (contextLimitError(errorBody)) throw contextLimitFailure();
+      throw new DeveloperProposalError("ai-provider", "REQUEST_REJECTED", "The provider rejected the Developer proposal request. Check the selected model's token parameter and JSON-mode support. No GitHub changes were made.");
+    }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new DeveloperProposalError("ai-provider", "HTTP_ERROR", `The AI provider request failed (HTTP ${response.status}).`);
+    }
     let payload: unknown;
     try { payload = await readProviderJson(response); }
     catch (error) {
       if (error instanceof ProviderResponseError && error.code === "TOO_LARGE") throw new DeveloperProposalError("structured-output", "RESPONSE_TOO_LARGE", "The AI response exceeded its size limit. Choose a smaller task. No GitHub changes were made.");
-      throw new DeveloperProposalError("ai-provider", "UNREADABLE_RESPONSE", "The AI response timed out or could not be read. No GitHub changes were made.");
+      if (error instanceof ProviderResponseError && error.code === "INVALID_JSON") throw new DeveloperProposalError("structured-output", "INVALID_JSON", "The AI provider returned a body that was not valid JSON. No GitHub changes were made.");
+      if (requestSignal.aborted) throw new DeveloperProposalError("ai-provider", "TIMEOUT", "The AI provider response timed out while being read. No GitHub changes were made.");
+      throw new DeveloperProposalError("ai-provider", "UNREADABLE_RESPONSE", "The AI response stream was interrupted or could not be read. No GitHub changes were made.");
     }
     if (contextLimitError(payload)) throw contextLimitFailure();
     if (object(payload)?.error != null) throw new DeveloperProposalError("ai-provider", "PROVIDER_ERROR", "The AI provider returned an error instead of a proposal. Check provider availability and model settings. No GitHub changes were made.");
@@ -185,7 +232,10 @@ async function generate(task: string, context: Context, failure?: { summary: str
       || (!raw?.trim() && usage.success && usage.data.completion_tokens >= env.DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS);
     if (outputLimitReached) {
       invalid = truncationFailure();
-      if (attempt === 0) messages.push({ role: "user", content: "The previous response reached the model output limit. Discard it completely; do not continue or repair partial JSON. Propose the smallest complete implementation of the selected task, preferably one necessary file. Return one complete JSON object with full final file contents within the stated limits. If that cannot fit, do not invent a partial file." });
+      if (attempt === 0) {
+        messages[1] = { role: "user", content: JSON.stringify({ task, readableFiles: compactRetryFiles(context), ...(failure ? { ciFailure: failure } : {}) }) };
+        messages.push({ role: "user", content: "The previous response reached the model output limit. Discard it completely; do not continue or repair partial JSON. Propose the smallest complete implementation of the selected task, preferably one necessary file. Return one complete JSON object with full final file contents within the stated limits. If that cannot fit, do not invent a partial file." });
+      }
       continue;
     }
     if (choice.finish_reason === "content_filter") throw new DeveloperProposalError("ai-provider", "CONTENT_FILTERED", "The provider filtered the proposal response. No GitHub changes were made.");
@@ -194,7 +244,7 @@ async function generate(task: string, context: Context, failure?: { summary: str
     if (typeof message.refusal === "string" && message.refusal.trim()) throw envelopeFailure("MODEL_REFUSAL", "The model refused to produce a proposal. Choose a supported task or model.", payload, response.status);
     if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) throw envelopeFailure("UNEXPECTED_TOOL_CALL", "The model returned a tool call, but Developer proposals require final JSON text. Choose a JSON-capable text model.", payload, response.status);
     if (content !== undefined && content !== null && raw === undefined) throw envelopeFailure("UNSUPPORTED_CONTENT", "The provider returned non-text content instead of a JSON proposal. Choose a text-output model that supports Chat Completions JSON mode.", payload, response.status);
-    if (!raw?.trim() && (message.reasoning != null || message.reasoning_details != null || message.reasoning_content != null || message.tool_calls != null || message.refusal != null)) throw envelopeFailure("NO_FINAL_CONTENT", "The provider returned reasoning, a tool call, or a refusal without final proposal text. Choose a model that returns a final JSON text response.", payload, response.status);
+    if (!raw?.trim() && (message.reasoning != null || message.reasoning_details != null || message.reasoning_content != null || message.tool_calls != null || message.refusal != null)) throw envelopeFailure("NO_FINAL_CONTENT", "The model returned reasoning but no final proposal text. Choose a model that emits final assistant text; enable JSON mode only if supported.", payload, response.status);
     if (typeof raw !== "string" || !raw.trim()) invalid = new DeveloperProposalError("structured-output", "EMPTY_CONTENT", "The model returned no proposal text after one retry. Check that the selected model supports JSON text output. No GitHub changes were made.");
     else if (raw.length > 200_000) invalid = new DeveloperProposalError("structured-output", "RESPONSE_TOO_LARGE", "The model response exceeded Forge's response-size limit. Choose a smaller task. No GitHub changes were made.");
     else {
@@ -208,13 +258,19 @@ async function generate(task: string, context: Context, failure?: { summary: str
         if (!parsed.success) {
           failingFields = schemaFields(parsed.error);
           invalid = new DeveloperProposalError("structured-output", "INVALID_SCHEMA", `The AI proposal did not match the required structure (${failingFields}) after one retry.`);
+        } else if (parsed.data.files.reduce((sum, file) => sum + file.content.length, 0) > maxFileContentCharacters) {
+          failingFields = "files";
+          invalid = new DeveloperProposalError("structured-output", "OUTPUT_TOO_LARGE", "The complete proposal exceeds the configured output budget. Reduce the task or use a model that supports a larger output budget.");
         } else if (!parsed.data.files.every(file => !existing.has(file.path) || allowedExisting.has(file.path))) {
           failingFields = "files.path";
           invalid = new DeveloperProposalError("repository-validation", "UNINSPECTED_FILE", "The AI tried to replace a file Forge did not inspect fully after one retry.");
         }
         else return parsed.data;
       }
-      if (attempt === 0) messages.push({ role: "user", content: `The prior proposal failed validation (${invalid.code}). Invalid fields: ${failingFields}. ${invalid.message}\nPreserve these already-valid non-file fields where they still fit the task: ${JSON.stringify(previousValidFields)}. Return ONLY one corrected complete JSON object; repeat every required key and every complete file content. Do not include the old invalid path or any extra prose.\n${failure ? fixContract : proposalContract}` });
+      if (attempt === 0) {
+        messages[1] = { role: "user", content: JSON.stringify({ task, readableFiles: compactRetryFiles(context), ...(failure ? { ciFailure: failure } : {}) }) };
+        messages.push({ role: "user", content: `The prior proposal failed validation (${invalid.code}). Invalid fields: ${failingFields}. ${invalid.message}\nPreserve these already-valid non-file fields where they still fit the task: ${JSON.stringify(previousValidFields)}. Return ONLY one corrected complete JSON object; repeat every required key and every complete file content. Do not include the old invalid path or any extra prose.\n${contract}` });
+      }
     }
   }
   throw invalid;
