@@ -2,6 +2,7 @@ import { z } from "zod";
 import { serverEnv } from "@/lib/env";
 import { resultSchema, type AgentResult } from "./schemas";
 import { ProviderResponseError, readProviderJson } from "./response";
+import { completionOptions } from "./completion-options";
 
 export { resultSchema } from "./schemas";
 export type { AgentResult } from "./schemas";
@@ -100,7 +101,7 @@ export function provider(): AiProvider {
         try { response = await fetch(`${(env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "")}/chat/completions`, {
           method: "POST",
           headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ model: env.OPENAI_MODEL, response_format: { type: "json_object" }, messages }),
+          body: JSON.stringify({ model: env.OPENAI_MODEL, ...completionOptions(env), messages }),
           signal: requestSignal,
           cache: "no-store",
           redirect: "error",
@@ -120,6 +121,7 @@ export function provider(): AiProvider {
         try { payload = await readProviderJson(response); }
         catch (error) {
           if (error instanceof ProviderResponseError && error.code === "TOO_LARGE") throw new AiProviderError("AI provider response exceeded its size limit.", "AI_INVALID_RESULT");
+          if (error instanceof ProviderResponseError && error.code === "INVALID_JSON") throw new AiProviderError("AI provider response was not valid JSON.", "AI_INVALID_RESULT");
           // A provider can send headers before timing out while generating the
           // JSON body. Recover that interrupted request just like a fetch error.
           const code = requestSignal.aborted ? "AI_TIMEOUT" : "AI_UNAVAILABLE";

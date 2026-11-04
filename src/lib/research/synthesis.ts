@@ -1,6 +1,7 @@
 import { serverEnv } from "../env";
 import { researchAnalysis, validateEvidence, type ResearchAnalysis, type ResearchEvidence } from "./contracts";
 import { z } from "zod";
+import { completionOptions } from "../agents/completion-options";
 
 export type ResearchSynthesisErrorCode = "RESEARCH_SYNTHESIS" | "AI_TIMEOUT" | "AI_UNAVAILABLE" | "AI_ACCESS_DENIED" | "AI_RATE_LIMITED" | "AI_INVALID_RESULT";
 export class ResearchSynthesisError extends Error {
@@ -60,7 +61,7 @@ async function synthesizeResearchInternal(goal: string, sources: ResearchEvidenc
       response = await fetch(`${(env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "")}/chat/completions`, {
         method: "POST",
         headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: env.OPENAI_MODEL, response_format: { type: "json_object" }, max_completion_tokens: completionBudget, messages }),
+        body: JSON.stringify({ model: env.OPENAI_MODEL, ...completionOptions(env, completionBudget), messages }),
         signal: AbortSignal.timeout(RESEARCH_SYNTHESIS_TIMEOUT_MS),
         cache: "no-store",
         redirect: "error",

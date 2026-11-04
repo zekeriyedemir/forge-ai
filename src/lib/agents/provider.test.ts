@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const config = vi.hoisted(() => ({ demoMode: "true", apiKey: "" }));
-vi.mock("@/lib/env", () => ({ serverEnv: () => ({ DATABASE_URL: "postgresql://localhost/forge", AUTH_SECRET: "a".repeat(32), DEMO_MODE: config.demoMode, OPENAI_API_KEY: config.apiKey, OPENAI_BASE_URL: "https://example.test/v1/", OPENAI_MODEL: "test-model" }) }));
+const config = vi.hoisted(() => ({ demoMode: "true", apiKey: "", tokenParameter: "max_completion_tokens", jsonMode: "true" }));
+vi.mock("@/lib/env", () => ({ serverEnv: () => ({ DATABASE_URL: "postgresql://localhost/forge", AUTH_SECRET: "a".repeat(32), DEMO_MODE: config.demoMode, OPENAI_API_KEY: config.apiKey, OPENAI_BASE_URL: "https://example.test/v1/", OPENAI_MODEL: "test-model", OPENAI_TOKEN_PARAMETER: config.tokenParameter, OPENAI_JSON_MODE: config.jsonMode }) }));
 import { AGENT_REQUEST_TIMEOUT_MS, AiProviderError, demoProvider, resultSchema, provider } from "./provider";
 
 const jsonResponse = (payload: unknown, status = 200) => new Response(JSON.stringify(payload), { status });
 
-beforeEach(() => { config.demoMode = "true"; config.apiKey = ""; vi.unstubAllGlobals(); vi.spyOn(console, "warn").mockImplementation(() => {}); });
+beforeEach(() => { config.demoMode = "true"; config.apiKey = ""; config.tokenParameter = "max_completion_tokens"; config.jsonMode = "true"; vi.unstubAllGlobals(); vi.spyOn(console, "warn").mockImplementation(() => {}); });
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("agent provider", () => {
@@ -53,6 +53,21 @@ describe("agent provider", () => {
     expect(request.response_format).toEqual({ type: "json_object" });
     expect(request.messages[0].content).toContain("Metric keys must be unique ASCII lowercase snake_case");
     expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  it("omits JSON mode when disabled for a model/API that does not support it", async () => {
+    config.demoMode = "false";
+    config.apiKey = "test-only-key";
+    config.tokenParameter = "max_tokens";
+    config.jsonMode = "false";
+    const output = { summary: "Ready", tasks: [], reports: [], metrics: [] };
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ choices: [{ message: { content: JSON.stringify(output) } }] }));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await provider().generate("FOUNDER", "Build a useful service", "")).toEqual(output);
+    const request = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(request.response_format).toBeUndefined();
+    expect(request.max_tokens).toBeUndefined();
+    expect(request.max_completion_tokens).toBeUndefined();
   });
 
   it("accepts a complete JSON object wrapped in a markdown fence", async () => {

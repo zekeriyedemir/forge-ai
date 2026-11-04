@@ -21,8 +21,8 @@ describe("bounded provider response parsing", () => {
     await expect(readProviderJson(new Response(stream))).rejects.toMatchObject({ code: "UNREADABLE", message: "Provider response could not be read." });
   });
 
-  it("returns null for malformed JSON and parses UTF-8 across chunks", async () => {
-    expect(await readProviderJson(new Response("<html>upstream error</html>"))).toBeNull();
+  it("classifies malformed JSON and parses UTF-8 across chunks", async () => {
+    await expect(readProviderJson(new Response("<html>upstream error</html>"))).rejects.toMatchObject({ code: "INVALID_JSON" });
     const bytes = new TextEncoder().encode('{"text":"Grüße"}');
     const stream = new ReadableStream<Uint8Array>({ start(controller) { bytes.forEach(byte => controller.enqueue(new Uint8Array([byte]))); controller.close(); } });
     expect(await readProviderJson(new Response(stream))).toEqual({ text: "Grüße" });
