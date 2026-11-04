@@ -1,6 +1,6 @@
 export class ProviderResponseError extends Error {
-  constructor(readonly code: "TOO_LARGE" | "UNREADABLE") {
-    super(code === "TOO_LARGE" ? "Provider response exceeded its size limit." : "Provider response could not be read.");
+  constructor(readonly code: "TOO_LARGE" | "UNREADABLE" | "INVALID_JSON") {
+    super(code === "TOO_LARGE" ? "Provider response exceeded its size limit." : code === "INVALID_JSON" ? "Provider response was not valid JSON." : "Provider response could not be read.");
     this.name = "ProviderResponseError";
   }
 }
@@ -30,5 +30,5 @@ export async function readProviderJson(response: Response, maxBytes = 512 * 1024
     reader.releaseLock();
   }
   try { return JSON.parse(Buffer.concat(chunks, size).toString("utf8")); }
-  catch { return null; }
+  catch { throw new ProviderResponseError("INVALID_JSON"); }
 }

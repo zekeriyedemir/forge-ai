@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   findGoal: vi.fn(), upsertAgent: vi.fn(), createEvent: vi.fn(), createActivity: vi.fn(),
   readContext: vi.fn(), createTask: vi.fn(), createReport: vi.fn(), saveMetric: vi.fn(), generate: vi.fn(),
   collectResearch: vi.fn(), researchReport: vi.fn(), createSession: vi.fn(), createSource: vi.fn(), createFinding: vi.fn(), upsertSession: vi.fn(), findSession: vi.fn(),
+  assertResearchAvailable: vi.fn(), createProvider: vi.fn(),
 }));
 
 vi.mock("@/lib/db", () => {
@@ -18,9 +19,12 @@ vi.mock("@/lib/db", () => {
   return { db: { ...tx, $transaction: mocks.transaction.mockImplementation((work: (client: typeof tx) => Promise<unknown>) => work(tx)) } };
 });
 vi.mock("./tools", () => ({ tools: { readProjectContext: mocks.readContext, createTask: mocks.createTask, createReport: mocks.createReport, saveMetric: mocks.saveMetric } }));
-vi.mock("./provider", () => ({ AiProviderError: class AiProviderError extends Error {}, provider: () => ({ name: "mock", model: "test", generate: mocks.generate }), demoProvider: () => ({ name: "mock", model: "test", generate: mocks.generate }) }));
+vi.mock("./provider", () => ({ AiProviderError: class AiProviderError extends Error {}, provider: mocks.createProvider, demoProvider: () => ({ name: "mock", model: "test", generate: mocks.generate }) }));
 vi.mock("../research/provider", () => ({
-  ResearchProviderError: class ResearchProviderError extends Error {},
+  ResearchProviderError: class ResearchProviderError extends Error {
+    constructor(message: string, readonly code = "RESEARCH_UNAVAILABLE") { super(message); }
+  },
+  assertResearchAvailable: mocks.assertResearchAvailable,
   researchProviderConfigured: (env: Record<string, string | undefined> = process.env) => Boolean(env.BRAVE_SEARCH_API_KEY?.trim() || env.RESEARCH_SEARXNG_BASE_URL?.trim()),
   researchProviderFromEnv: (env: Record<string, string | undefined> = process.env) => ({ name: env.BRAVE_SEARCH_API_KEY?.trim() ? "brave-search" : "searxng" }),
   braveResearchProvider: () => ({ name: "mock-search" }),
@@ -28,7 +32,8 @@ vi.mock("../research/provider", () => ({
 vi.mock("../research/runtime", () => ({ collectResearch: mocks.collectResearch, researchReport: mocks.researchReport }));
 
 import { AiProviderError } from "./provider";
-import { advanceWorkflow, startWorkflow } from "./runtime";
+import { advanceWorkflow, startWorkflow, WorkflowPreflightError } from "./runtime";
+import { ResearchProviderError } from "../research/provider";
 import { ResearchSynthesisError } from "../research/synthesis";
 
 const projectId = "project-id";
@@ -37,7 +42,12 @@ const pendingRun = { id: "run-id", type: "RESEARCH" as const, status: "PENDING" 
 
 beforeEach(() => {
   vi.stubEnv("DEMO_MODE", "true");
+  vi.stubEnv("BRAVE_SEARCH_API_KEY", "");
+  vi.stubEnv("RESEARCH_SEARXNG_BASE_URL", "");
+  vi.stubEnv("OPENAI_API_KEY", "");
   vi.clearAllMocks();
+  mocks.assertResearchAvailable.mockReset().mockResolvedValue(undefined);
+  mocks.createProvider.mockReset().mockReturnValue({ name: "mock", model: "test", generate: mocks.generate });
   vi.spyOn(console, "error").mockImplementation(() => {});
   mocks.findRun.mockResolvedValue(null);
   mocks.countRuns.mockResolvedValue(0);
@@ -53,6 +63,72 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 describe("workflow persistence", () => {
+  it("rejects an unavailable live research service before queuing work or calling AI", async () => {
+    vi.stubEnv("DEMO_MODE", "false");
+    mocks.assertResearchAvailable.mockRejectedValue(new ResearchProviderError("connect failed at https://private-key@search.invalid", "RESEARCH_UNAVAILABLE"));
+
+    const failure = await startWorkflow(projectId).catch(error => error);
+
+    expect(failure).toBeInstanceOf(WorkflowPreflightError);
+    expect(failure).toMatchObject({ code: "RESEARCH_UNAVAILABLE" });
+    expect(failure.message).toContain("npm run research:start");
+    expect(failure.message).not.toContain("private-key");
+    expect(mocks.assertResearchAvailable).toHaveBeenCalledOnce();
+    expect(mocks.generate).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+    expect(mocks.upsertAgent).not.toHaveBeenCalled();
+    expect(mocks.createRun).not.toHaveBeenCalled();
+    expect(mocks.createActivity).not.toHaveBeenCalled();
+  });
+
+  it("resumes existing live work even when providers are unavailable", async () => {
+    vi.stubEnv("DEMO_MODE", "false");
+    mocks.findRun.mockResolvedValue({ workflowId });
+    mocks.createProvider.mockImplementation(() => { throw new Error("AI unavailable"); });
+    mocks.assertResearchAvailable.mockRejectedValue(new ResearchProviderError("Search unavailable"));
+
+    expect(await startWorkflow(projectId)).toBe(workflowId);
+    expect(mocks.createProvider).not.toHaveBeenCalled();
+    expect(mocks.assertResearchAvailable).not.toHaveBeenCalled();
+    expect(mocks.createRun).not.toHaveBeenCalled();
+  });
+
+  it("probes live search outside the write transaction before queuing ordered runs", async () => {
+    vi.stubEnv("DEMO_MODE", "false");
+    mocks.assertResearchAvailable.mockImplementation(async () => {
+      expect(mocks.transaction).not.toHaveBeenCalled();
+      expect(mocks.createRun).not.toHaveBeenCalled();
+    });
+
+    await startWorkflow(projectId);
+
+    expect(mocks.assertResearchAvailable).toHaveBeenCalledOnce();
+    expect(mocks.createRun).toHaveBeenCalledTimes(5);
+    expect(mocks.generate).not.toHaveBeenCalled();
+  });
+
+  it("checks AI configuration before the live search probe", async () => {
+    vi.stubEnv("DEMO_MODE", "false");
+    mocks.createProvider.mockImplementation(() => { throw new Error("API key private-key is invalid"); });
+
+    await expect(startWorkflow(projectId)).rejects.toMatchObject({ code: "AI_NOT_CONFIGURED" });
+    expect(mocks.assertResearchAvailable).not.toHaveBeenCalled();
+    expect(mocks.createRun).not.toHaveBeenCalled();
+  });
+
+  it("keeps demo workflows available offline without probing live research", async () => {
+    mocks.assertResearchAvailable.mockRejectedValue(new ResearchProviderError("Offline"));
+    await startWorkflow(projectId);
+    mocks.findRun.mockResolvedValue(pendingRun);
+    await advanceWorkflow(projectId, workflowId);
+
+    expect(mocks.createRun).toHaveBeenCalledTimes(5);
+    expect(mocks.assertResearchAvailable).not.toHaveBeenCalled();
+    expect(mocks.collectResearch).not.toHaveBeenCalled();
+    expect(mocks.generate).toHaveBeenCalledOnce();
+    expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "COMPLETED", provider: "mock" }) }));
+  });
+
   it("creates ordered runs, reuses an active workflow, and allows a new one after failure", async () => {
     const firstWorkflow = await startWorkflow(projectId);
     expect(mocks.createRun).toHaveBeenCalledTimes(5);
@@ -127,6 +203,7 @@ describe("workflow persistence", () => {
     await expect(advanceWorkflow(projectId, workflowId)).rejects.toThrow("invalid structured result");
     expect(mocks.createTask).not.toHaveBeenCalled();
     expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: "FAILED", error: "We couldn't get a complete response from the AI provider. Please try again or check your AI configuration." }) }));
+    expect(mocks.createEvent).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ kind: "failed", data: { code: "AI_PROVIDER" } }) }));
     expect(console.error).toHaveBeenCalledWith("Forge agent run failed", { projectId, workflowId, runId: "run-id", code: "AI_PROVIDER" });
   });
 
@@ -222,6 +299,19 @@ describe("workflow persistence", () => {
     await expect(advanceWorkflow(projectId, workflowId)).rejects.toThrow("Research AI request timed out.");
     expect(mocks.upsertSession).toHaveBeenCalledWith(expect.objectContaining({ create: expect.objectContaining({ status: "FAILED", limitations: "We couldn't finish analyzing the research. Please try again." }) }));
     expect(mocks.upsertSession.mock.calls[0][0].create.limitations).not.toContain("retrievable public HTML");
+  });
+
+  it("persists a safe research cause code without storing private provider details", async () => {
+    vi.stubEnv("DEMO_MODE", "false");
+    vi.stubEnv("BRAVE_SEARCH_API_KEY", "test-only-key");
+    vi.stubEnv("OPENAI_API_KEY", "test-only-ai-key");
+    mocks.findRun.mockResolvedValue({ ...pendingRun, step: 1 });
+    mocks.collectResearch.mockRejectedValue(new ResearchProviderError("Provider denied private-key at internal-host", "RESEARCH_ACCESS_DENIED"));
+
+    await expect(advanceWorkflow(projectId, workflowId)).rejects.toThrow("Provider denied");
+
+    expect(mocks.createEvent).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ kind: "failed", data: { code: "RESEARCH_ACCESS_DENIED" }, message: expect.stringContaining("enable JSON") }) }));
+    expect(JSON.stringify([mocks.createEvent.mock.calls, mocks.upsertSession.mock.calls, mocks.updateMany.mock.calls, vi.mocked(console.error).mock.calls])).not.toContain("private-key");
   });
 
   it("does not persist research evidence after losing the run claim", async () => {

@@ -49,3 +49,43 @@ test("another workspace's project stays inaccessible", async ({ page, signedInUs
     await signedInUser.db.workspace.delete({ where: { id: otherWorkspace.id } });
   }
 });
+
+test("workflow failures show a safe, actionable cause and allow a fresh retry", async ({ page, signedInUser }) => {
+  const workspace = await signedInUser.db.workspace.create({ data: { name: "Workflow error regression", members: { create: { userId: signedInUser.id, role: "OWNER" } }, projects: { create: { name: "Workflow recovery", goals: { create: { statement: "Validate a focused workflow for independent developers" } } } } }, include: { projects: true } });
+  const projectId = workspace.projects[0].id;
+  let starts = 0;
+  let advances = 0;
+  await page.route(`**/api/projects/${projectId}/workflow`, async route => {
+    if (route.request().method() === "POST") {
+      starts++;
+      await route.fulfill(starts === 1
+        ? { status: 503, json: { code: "RESEARCH_NOT_CONFIGURED", error: "private-provider-diagnostic" } }
+        : { status: 200, json: { workflowId: crypto.randomUUID() } });
+      return;
+    }
+    advances++;
+    await route.fulfill({ status: 200, json: {
+      failure: { code: "RESEARCH_UNAVAILABLE", message: "private-provider-diagnostic" },
+      runs: [
+        { type: "FOUNDER", status: "COMPLETED", error: null },
+        { type: "RESEARCH", status: "FAILED", errorCode: "RESEARCH_UNAVAILABLE", error: "private-provider-diagnostic" },
+        ...["FOUNDER", "DEVELOPER", "ANALYST"].map(type => ({ type, status: "FAILED", error: "Skipped because an earlier agent failed" })),
+      ],
+    } });
+  });
+  await page.goto(`/dashboard/projects/${projectId}`);
+  const runButton = page.getByRole("button", { name: "Run Forge workflow" });
+  const workflowAlert = page.locator('.notice[role="alert"]');
+  await runButton.click();
+  await expect(workflowAlert).toContainText("Research is not configured.");
+  await expect(workflowAlert).not.toContainText("private-provider-diagnostic");
+  await runButton.click();
+  await expect(workflowAlert).toContainText("npm run research:start");
+  await expect(workflowAlert).not.toContainText("private-provider-diagnostic");
+  await expect(workflowAlert).not.toContainText("lost the workflow connection");
+  await expect(page.getByText("1 of 5 agents complete")).toBeVisible();
+  await expect(page.getByRole("link", { name: "View agent history" })).toHaveAttribute("href", `/dashboard/projects/${projectId}/agents`);
+  await expect(runButton).toBeEnabled();
+  expect(starts).toBe(2);
+  expect(advances).toBe(1);
+});

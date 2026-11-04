@@ -2,6 +2,7 @@ import { z } from "zod";
 import { serverEnv } from "@/lib/env";
 import { resultSchema, type AgentResult } from "./schemas";
 import { ProviderResponseError, readProviderJson } from "./response";
+import { completionOptions } from "./completion-options";
 
 export { resultSchema } from "./schemas";
 export type { AgentResult } from "./schemas";
@@ -13,12 +14,25 @@ export interface AiProvider {
   generate(kind: AgentKind, goal: string, context: string): Promise<AgentResult>;
 }
 
-export class AiProviderError extends Error {}
+export type AiProviderErrorCode = "AI_PROVIDER" | "AI_TIMEOUT" | "AI_UNAVAILABLE" | "AI_ACCESS_DENIED" | "AI_RATE_LIMITED" | "AI_INVALID_RESULT";
+export class AiProviderError extends Error {
+  constructor(message: string, readonly code: AiProviderErrorCode = "AI_PROVIDER") {
+    super(message);
+    this.name = "AiProviderError";
+  }
+}
 
 const completionSchema = z.object({ error: z.unknown().optional(), choices: z.array(z.object({ error: z.unknown().optional(), message: z.object({ content: z.union([z.string(), z.array(z.object({ type: z.literal("text"), text: z.string() }))]).nullable(), refusal: z.unknown().optional(), tool_calls: z.array(z.unknown()).optional() }), finish_reason: z.string().nullable().optional(), native_finish_reason: z.string().nullish() })).min(1) });
-const maxStructuredAttempts = 2;
-// Two attempts must leave room for database persistence in the 120s route budget.
+// Transport recovery and JSON repair share this budget; neither can restart it.
+const maxAttempts = 2;
+// Fetch cancellation also covers response-body reads. Two attempts leave room
+// for database persistence in the 120s route budget.
 export const AGENT_REQUEST_TIMEOUT_MS = 40_000;
+
+function recordRetry(kind: AgentKind, attempt: number, code: AiProviderErrorCode) {
+  // Fixed metadata only: never log provider bodies, prompts, URLs, or credentials.
+  console.warn("Forge AI provider retry", { kind, attempt: attempt + 1, code });
+}
 
 function parseStructuredResult(payload: unknown): { result: AgentResult; hint?: never } | { result?: never; hint: string } {
   const completion = completionSchema.safeParse(payload);
@@ -80,33 +94,46 @@ export function provider(): AiProvider {
         { role: "system", content: systemPrompt(kind) },
         { role: "user", content: `Business goal: ${goal}\nProject context: ${context}` },
       ];
-      for (let attempt = 0; attempt < maxStructuredAttempts; attempt++) {
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const canRetry = attempt + 1 < maxAttempts;
+        const requestSignal = AbortSignal.timeout(AGENT_REQUEST_TIMEOUT_MS);
         let response: Response;
         try { response = await fetch(`${(env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "")}/chat/completions`, {
           method: "POST",
           headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ model: env.OPENAI_MODEL, response_format: { type: "json_object" }, messages }),
-          signal: AbortSignal.timeout(AGENT_REQUEST_TIMEOUT_MS),
+          body: JSON.stringify({ model: env.OPENAI_MODEL, ...completionOptions(env), messages }),
+          signal: requestSignal,
           cache: "no-store",
           redirect: "error",
-        }); } catch { throw new AiProviderError("AI provider request timed out or could not connect."); }
-        if (response.status === 401 || response.status === 403) throw new AiProviderError("AI provider rejected its credentials or model access.");
-        if (response.status === 429) throw new AiProviderError("AI provider rate limit reached. Try again later.");
-        if ([502, 503, 504].includes(response.status) && attempt === 0) {
-          await response.body?.cancel().catch(() => {});
-          continue;
+        }); } catch {
+          const code = requestSignal.aborted ? "AI_TIMEOUT" : "AI_UNAVAILABLE";
+          if (canRetry) { recordRetry(kind, attempt, code); continue; }
+          throw new AiProviderError("AI provider request timed out or could not connect.", code);
         }
-        if (!response.ok) throw new AiProviderError(`AI provider request failed (${response.status}).`);
+        // Discard an error response before either retrying or returning. Its
+        // provider-controlled body is never needed for a safe diagnostic.
+        if (!response.ok) await response.body?.cancel().catch(() => {});
+        if (response.status === 401 || response.status === 403) throw new AiProviderError("AI provider rejected its credentials or model access.", "AI_ACCESS_DENIED");
+        if (response.status === 429) throw new AiProviderError("AI provider rate limit reached. Try again later.", "AI_RATE_LIMITED");
+        if ([502, 503, 504].includes(response.status) && canRetry) { recordRetry(kind, attempt, "AI_UNAVAILABLE"); continue; }
+        if (!response.ok) throw new AiProviderError(`AI provider request failed (${response.status}).`, response.status >= 500 ? "AI_UNAVAILABLE" : "AI_PROVIDER");
         let payload: unknown;
         try { payload = await readProviderJson(response); }
         catch (error) {
-          throw new AiProviderError(error instanceof ProviderResponseError && error.code === "TOO_LARGE" ? "AI provider response exceeded its size limit." : "AI provider response timed out or could not be read.");
+          if (error instanceof ProviderResponseError && error.code === "TOO_LARGE") throw new AiProviderError("AI provider response exceeded its size limit.", "AI_INVALID_RESULT");
+          if (error instanceof ProviderResponseError && error.code === "INVALID_JSON") throw new AiProviderError("AI provider response was not valid JSON.", "AI_INVALID_RESULT");
+          // A provider can send headers before timing out while generating the
+          // JSON body. Recover that interrupted request just like a fetch error.
+          const code = requestSignal.aborted ? "AI_TIMEOUT" : "AI_UNAVAILABLE";
+          if (canRetry) { recordRetry(kind, attempt, code); continue; }
+          throw new AiProviderError("AI provider response timed out or could not be read.", code);
         }
         const parsed = parseStructuredResult(payload);
         if (parsed.result) return parsed.result;
+        if (canRetry) recordRetry(kind, attempt, "AI_INVALID_RESULT");
         messages.push({ role: "user", content: `The previous response did not satisfy the required JSON contract. ${parsed.hint} Regenerate the complete result from scratch. Return JSON only.` });
       }
-      throw new AiProviderError("AI provider returned an invalid structured result after one retry.");
+      throw new AiProviderError("AI provider returned an invalid structured result after one retry.", "AI_INVALID_RESULT");
     },
   };
 }

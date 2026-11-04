@@ -96,14 +96,20 @@ Keep values in ignored `.env` files or your host's secret settings. See [.env.ex
 | `AUTH_TRUST_HOST` | Set `true` only behind a trusted self-hosted proxy; inferred on Vercel. |
 | `DEMO_MODE` | Default `false`; `true` selects deterministic AI and enables a shared local development account. Production never grants anonymous workspace access. |
 | `OPENAI_API_KEY` | Server-only credential for live AI; not needed by `/demo` or deterministic mode. |
-| `OPENAI_BASE_URL` | Optional compatible API base; defaults to `https://api.openai.com/v1`. |
-| `OPENAI_MODEL` | JSON-mode-capable model; defaults to `gpt-4o-mini`. |
+| `OPENAI_BASE_URL` | Compatible API base; defaults to `https://api.openai.com/v1`. Set to `https://openrouter.ai/api/v1` when using OpenRouter. |
+| `OPENAI_MODEL` | Model identifier at the configured API; defaults to `gpt-4o-mini`. Choose one that returns final assistant text; JSON mode alone cannot make a reasoning-only model usable. |
+| `OPENAI_TOKEN_PARAMETER` | `max_completion_tokens` (default) or `max_tokens`, according to the configured provider/model. |
+| `OPENAI_JSON_MODE` | `true` (default) sends Chat Completions JSON mode; set `false` only if the selected model/API does not support it. Forge still validates returned JSON. |
 | `RESEARCH_PROVIDER` | `auto`, `searxng`, or `brave`. Auto prefers configured SearXNG. |
 | `RESEARCH_SEARXNG_BASE_URL` | SearXNG instance with JSON search enabled. |
 | `BRAVE_SEARCH_API_KEY` | Optional alternative search credential. |
 | `DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS` | Proposal output budget, 1,024–32,768; default 8,192. |
 
-Live workflows require AI **and** a research provider. Missing configuration produces a safe failed run, never fabricated evidence. Demo mode always uses sample output, even if a live key is present. All provider credentials stay on the server.
+For OpenRouter, set `OPENAI_API_KEY` to an OpenRouter key, `OPENAI_BASE_URL="https://openrouter.ai/api/v1"`, `OPENAI_MODEL` to a specific model id, and usually `OPENAI_TOKEN_PARAMETER="max_tokens"`. Set JSON mode according to that model's documented capabilities. Do not use a reasoning-only response or rotating free model route for repository proposals; Forge requires final text containing the complete JSON proposal. See [provider troubleshooting](docs/deployment.md#ai-and-demo-behavior).
+
+Live workflows require AI **and** a research provider. For local search, start Docker and run `npm run research:start`, then set `RESEARCH_PROVIDER="searxng"` and `RESEARCH_SEARXNG_BASE_URL="http://localhost:8080"`. Restart Forge after changing `.env`. The command starts a private SearXNG container with JSON search enabled; it works with either the local database or Neon. See [research setup and troubleshooting](docs/research.md).
+
+Forge checks search connectivity before queuing a live workflow or calling AI. An unavailable search service shows an actionable error without consuming an attempt. Failures during execution identify the failing step and mark its dependent steps as skipped. Demo mode always uses sample output, even if a live key is present. All provider credentials stay on the server.
 
 ## Testing
 

@@ -9,5 +9,24 @@ services:
       - "5432:5432"
     volumes:
       - forge_pg:/var/lib/postgresql/data
+  searxng:
+    image: docker.io/searxng/searxng:2026.10.4-d48c4b555
+    profiles: [research]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      FORCE_OWNERSHIP: "false"
+      SEARXNG_BASE_URL: "http://localhost:8080/"
+    volumes:
+      - ./.local/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - forge_searxng:/var/cache/searxng
+    healthcheck:
+      test: ["CMD", "/usr/local/searxng/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/', timeout=3).close()"]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 10s
 volumes:
   forge_pg:
+  forge_searxng:

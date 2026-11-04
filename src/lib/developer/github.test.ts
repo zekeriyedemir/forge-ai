@@ -69,6 +69,30 @@ describe("task-aware inspection and CI", () => {
     expect(context.files.length).toBeLessThanOrEqual(10);
   });
 
+  it("bounds proposal context by file count and aggregate content while retaining the full path index", async () => {
+    const sha = "a".repeat(40);
+    const paths = [
+      ...Array.from({ length: 8 }, (_, index) => `src/lib/target-${index}.ts`),
+      "src/lib/target-large.ts",
+    ];
+    const fetchMock = vi.fn(async (input: string) => ({
+      ok: true,
+      status: 200,
+      json: async () => input.includes("/git/commits/")
+        ? { sha, tree: { sha: "b".repeat(40) } }
+        : input.includes("/git/trees/")
+          ? { truncated: false, tree: paths.map(path => ({ path, type: "blob", mode: "100644", size: path.endsWith("large.ts") ? 13_000 : 7_000 })) }
+          : { encoding: "base64", content: Buffer.from("x".repeat(7_000)).toString("base64") },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const context = await new GitHubDeveloperClient("test-only").context("owner/repo", sha, "Update target");
+    expect(context.paths).toContain("src/lib/target-large.ts");
+    expect(context.files.length).toBeLessThanOrEqual(6);
+    expect(context.files.every(file => Buffer.byteLength(file.content) <= 12_000)).toBe(true);
+    expect(context.files.reduce((total, file) => total + Buffer.byteLength(file.content), 0)).toBeLessThanOrEqual(24_000);
+    expect(context.files.map(file => file.path)).not.toContain("src/lib/target-large.ts");
+  });
+
   it("reduces logs to safe codes and paths, without forwarding credentials or values", () => {
     const log = `DATABASE_URL=postgres://user:secret@db.example/test\nsrc/lib/payments.ts:12 error TS2322: sk-very-secret-value\nFAIL tests/payments.test.ts\n`;
     const diagnostics = extractSafeDiagnostics(log);
