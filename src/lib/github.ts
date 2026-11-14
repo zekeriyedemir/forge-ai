@@ -13,7 +13,7 @@ const repositorySchema = z.object({
 
 export async function githubToken(userId: string) {
   if (process.env.DEMO_MODE === "true") throw new GitHubIntegrationError("GitHub access is disabled in demo mode. Use an authenticated workspace with demo mode turned off.");
-  const account = await db.account.findFirst({ where: { userId, provider: "github" }, select: { providerAccountId: true, access_token: true, refresh_token: true, expires_at: true } });
+  const account = await db.account.findFirst({ where: { userId, provider: "github" }, select: { provider: true, providerAccountId: true, access_token: true, refresh_token: true, expires_at: true } });
   if (!account?.access_token) return null;
   if (!account.expires_at || account.expires_at > Math.floor(Date.now() / 1000) + 60) return account.access_token;
   const clientId = process.env.AUTH_GITHUB_ID;

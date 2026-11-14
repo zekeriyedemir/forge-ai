@@ -1,5 +1,5 @@
-import { Prisma } from "@prisma/client";
 import { userLimits } from "@/lib/env";
+import type { DbTransaction } from "@/lib/db";
 
 export type UserLimitKind = "projects" | "workflows" | "developerProposals";
 
@@ -17,7 +17,7 @@ export class UserLimitError extends Error {
 
 const windowStart = (now: Date) => new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
-export async function assertUserLimit(tx: Prisma.TransactionClient, userId: string, kind: UserLimitKind, now = new Date()) {
+export async function assertUserLimit(tx: DbTransaction, userId: string, kind: UserLimitKind, now = new Date()) {
   const limits = userLimits();
   const limit = kind === "projects"
     ? limits.MAX_PROJECTS_PER_USER

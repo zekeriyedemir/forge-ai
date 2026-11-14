@@ -1,9 +1,8 @@
 import { z } from "zod";
-import { Prisma } from "@prisma/client";
-import { db } from "@/lib/db";
+import { db, type DbTransaction } from "@/lib/db";
 import { MetricKeyConflictError, metricSchema, reportSchema, taskSchema } from "./schemas";
 
-export type ToolContext = { projectId: string; runId: string; client?: Prisma.TransactionClient };
+export type ToolContext = { projectId: string; runId: string; client?: DbTransaction };
 
 export const tools = {
   async createTask(ctx: ToolContext, input: unknown) {

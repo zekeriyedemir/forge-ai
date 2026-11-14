@@ -1,6 +1,6 @@
-import { AgentType, Prisma } from "@prisma/client";
+import { AgentType } from "@prisma/client";
 import { z, ZodError } from "zod";
-import { db } from "@/lib/db";
+import { db, type DbTransaction } from "@/lib/db";
 import { AiProviderError, demoProvider, provider } from "./provider";
 import { MetricKeyConflictError, resultSchema, type AgentResult } from "./schemas";
 import { tools } from "./tools";
@@ -24,7 +24,7 @@ export class WorkflowPreflightError extends Error {
   }
 }
 
-async function serializable<T>(work: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+async function serializable<T>(work: (tx: DbTransaction) => Promise<T>): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try { return await db.$transaction(work, { isolationLevel: "Serializable", maxWait: 10_000, timeout: 15_000 }); }
     catch (error) {
