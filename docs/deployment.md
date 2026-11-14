@@ -6,6 +6,10 @@ Create a Neon project and copy its **pooled** PostgreSQL connection string into 
 
 After setting both variables in your shell or private `.env`, run `npm ci`, `npm run db:migrate`, and optionally `npm run db:seed` for a disposable demo database. Run migrations against the target database before routing traffic to the new deployment. Do not point preview deployments at a production database. `prisma migrate dev` is for schema development, while `prisma migrate deploy` applies committed migrations.
 
+## Local Docker Compose database
+
+`docker-compose.yml` is for local development. PostgreSQL is published only on `127.0.0.1:5432`; its `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` come from `.env`. The example password is a local placeholder: replace it with a unique value for any shared development machine and keep it out of source control. The compose service is not a deployment database. Do not deploy it with the example credentials or `postgres/postgres`, and do not publish PostgreSQL publicly; use a managed database or a private network with deployment-specific credentials and access controls.
+
 ## GitHub OAuth and Auth.js
 
 Create a GitHub OAuth app with callback `https://YOUR_DOMAIN/api/auth/callback/github`. Set its client ID and secret as `AUTH_GITHUB_ID` and `AUTH_GITHUB_SECRET`. For local development use `http://localhost:3000/api/auth/callback/github`; GitHub supports multiple explicit callback URLs, or use separate OAuth apps for local and production. Auth.js v5 infers the normal host on Vercel, so do not set `AUTH_URL` to localhost in production. Only set `AUTH_URL` for a custom base path. Set a fresh, random `AUTH_SECRET` of at least 32 characters in every environment. Vercel host trust is detected automatically; set `AUTH_TRUST_HOST=true` only when self-hosting behind a trusted reverse proxy.
