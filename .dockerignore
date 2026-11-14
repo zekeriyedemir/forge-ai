@@ -9,4 +9,5 @@ playwright-report
 coverage
 .codex
 .agents
+.local
 *.tsbuildinfo

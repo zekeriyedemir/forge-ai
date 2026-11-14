@@ -64,13 +64,18 @@ export function extractSafeDiagnostics(log: string): string[] {
 }
 
 type TreeFile = { path: string; type: string; mode: string; size?: number };
+const MAX_CONTEXT_FILE_BYTES = 12_000;
+const MAX_CONTEXT_TOTAL_BYTES = 24_000;
+const MAX_CONTEXT_FILES = 6;
+const INITIAL_CONTEXT_FILES = 4;
+
 export function selectContextPaths(tree: TreeFile[], task: string, limit = 10): TreeFile[] {
   const words = [...new Set(task.toLowerCase().split(/[^a-z0-9]+/).filter(word => word.length >= 4 && !["task", "with", "from", "that", "this", "create", "build", "update", "existing", "file", "test"].includes(word)))].slice(0, 20);
-  const candidates = tree.filter(item => item.type === "blob" && item.mode === "100644" && item.size !== undefined && item.size <= 12_000 && (/^(?:README\.md|package\.json|tsconfig\.json|next\.config\.(?:ts|js)|vite\.config\.(?:ts|js)|vitest\.config\.(?:ts|js))$/.test(item.path) || safePath.safeParse(item.path).success));
+  const candidates = tree.filter(item => item.type === "blob" && item.mode === "100644" && item.size !== undefined && item.size <= MAX_CONTEXT_FILE_BYTES && (/^(?:README\.md|package\.json|tsconfig\.json|next\.config\.(?:ts|js)|vite\.config\.(?:ts|js)|vitest\.config\.(?:ts|js))$/.test(item.path) || safePath.safeParse(item.path).success));
   const score = (path: string) => {
     const lower = path.toLowerCase();
-    const stem = lower.split("/").at(-1)?.replace(/\.(?:test|spec)?\.(?:tsx?|jsx?)$/, "") ?? "";
-    return words.reduce((sum, word) => sum + (stem.includes(word) ? 16 : lower.includes(word) ? 8 : 0), 0)
+    const stem = lower.split("/").at(-1)?.replace(/\.(?:(?:test|spec)\.)?[jt]sx?$/, "") ?? "";
+    return words.reduce((sum, word) => sum + (stem === word ? 20 : stem.includes(word) ? 16 : lower.includes(word) ? 8 : 0), 0)
       + (/\.(?:test|spec)\.[jt]sx?$/.test(lower) || lower.includes("/__tests__/") ? 3 : 0)
       + (lower === "package.json" ? 3 : 0)
       + (lower === "tsconfig.json" || lower.startsWith("next.config.") ? 2 : 0);
@@ -110,15 +115,18 @@ export class GitHubDeveloperClient implements DeveloperGitHub {
     if (tree.truncated) throw new RepositoryValidationError("GitHub truncated the repository tree; Forge cannot inspect it safely.");
     if (tree.tree.length > 500) throw new RepositoryValidationError("Repository tree has more than 500 entries; Forge cannot inspect it safely.");
     const paths = tree.tree.map(item => item.path).filter(path => safePath.safeParse(path).success);
-    const selected = selectContextPaths(tree.tree, task).slice(0, 6);
+    const selected = selectContextPaths(tree.tree, task, INITIAL_CONTEXT_FILES);
     const candidates = new Map(selectContextPaths(tree.tree, task, 500).map(item => [item.path, item]));
     const files: { path: string; content: string }[] = [];
+    const attempted = new Set<string>();
     let totalBytes = 0;
     const read = async (item: TreeFile) => {
+      if (attempted.has(item.path) || files.length >= MAX_CONTEXT_FILES) return;
+      attempted.add(item.path);
       const raw = z.object({ content: z.string(), encoding: z.literal("base64") }).parse(await this.request(`${root}/contents/${item.path.split("/").map(encodeURIComponent).join("/")}?ref=${sha}`));
       const content = Buffer.from(raw.content.replace(/\s/g, ""), "base64").toString("utf8");
       const bytes = Buffer.byteLength(content);
-      if (bytes <= 12_000 && totalBytes + bytes <= 64_000 && !/[\u0000-\u0008\u000e-\u001f]/.test(content) && !/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|(?:ghp_|gho_|github_pat_)[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|(?:API_KEY|SECRET|PASSWORD|DATABASE_URL|AUTH_TOKEN)\s*[:=]\s*["']?[^\s"']{8,}/i.test(content)) { files.push({ path: item.path, content }); totalBytes += bytes; }
+      if (bytes <= MAX_CONTEXT_FILE_BYTES && totalBytes + bytes <= MAX_CONTEXT_TOTAL_BYTES && !/[\u0000-\u0008\u000e-\u001f]/.test(content) && !/-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|(?:ghp_|gho_|github_pat_)[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|(?:API_KEY|SECRET|PASSWORD|DATABASE_URL|AUTH_TOKEN)\s*[:=]\s*["']?[^\s"']{8,}/i.test(content)) { files.push({ path: item.path, content }); totalBytes += bytes; }
     };
     for (const item of selected) await read(item);
     const related = new Set<string>();
@@ -130,11 +138,11 @@ export class GitHubDeveloperClient implements DeveloperGitHub {
           if (safePath.safeParse(candidate).success && candidates.has(candidate)) related.add(candidate);
         }
       }
-      const stem = file.path.replace(/\.(?:test|spec)?\.[jt]sx?$/, "");
+      const stem = file.path.replace(/\.(?:(?:test|spec)\.)?[jt]sx?$/, "");
       for (const suffix of [".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"]) if (candidates.has(`${stem}${suffix}`)) related.add(`${stem}${suffix}`);
     }
-    for (const path of related) { if (files.length >= 10) break; const item = candidates.get(path); if (item && !selected.some(source => source.path === path)) await read(item); }
-    for (const item of selectContextPaths(tree.tree, task)) { if (files.length >= 10) break; if (!selected.some(source => source.path === item.path) && !files.some(file => file.path === item.path)) await read(item); }
+    for (const path of related) { if (files.length >= MAX_CONTEXT_FILES) break; const item = candidates.get(path); if (item) await read(item); }
+    for (const item of selectContextPaths(tree.tree, task, INITIAL_CONTEXT_FILES)) { if (files.length >= MAX_CONTEXT_FILES) break; await read(item); }
     return { paths, files };
   }
   async createBranch(fullName: string, branch: string, sha: string) {

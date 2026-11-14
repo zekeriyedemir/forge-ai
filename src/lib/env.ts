@@ -9,6 +9,8 @@ const schema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.url().regex(/^https?:\/\//).optional(),
   OPENAI_MODEL: z.string().default("gpt-4o-mini"),
+  OPENAI_TOKEN_PARAMETER: z.enum(["max_completion_tokens", "max_tokens"]).default("max_completion_tokens"),
+  OPENAI_JSON_MODE: z.enum(["true", "false"]).default("true"),
   RESEARCH_PROVIDER: z.enum(["auto", "searxng", "brave"]).default("auto"),
   RESEARCH_SEARXNG_BASE_URL: z.string().optional(),
   BRAVE_SEARCH_API_KEY: z.string().optional(),

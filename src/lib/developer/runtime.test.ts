@@ -64,6 +64,21 @@ function fakeGitHub() {
 beforeEach(() => { vi.clearAllMocks(); vi.spyOn(console, "error").mockImplementation(() => {}); state.owner = true; state.failTransaction = false; state.approvals.length = 0; state.executions.length = 0; state.events.length = 0; });
 
 describe("approved Developer execution", () => {
+  it.each([
+    ["NO_FINAL_CONTENT", "ai-provider"],
+    ["INVALID_JSON", "structured-output"],
+    ["TRUNCATED", "structured-output"],
+  ] as const)("does not persist or write GitHub for %s output failures", async (code, stage) => {
+    const { github } = fakeGitHub();
+    const failure = new DeveloperProposalError(stage, code, "Safe provider failure.");
+    await expect(createDeveloperProposal("project-id", "task-id", "user-id", github, async () => { throw failure; })).rejects.toBe(failure);
+    expect(state.executions).toHaveLength(0);
+    expect(state.approvals).toHaveLength(0);
+    expect(github.createBranch).not.toHaveBeenCalled();
+    expect(github.createCommit).not.toHaveBeenCalled();
+    expect(github.createPull).not.toHaveBeenCalled();
+  });
+
   it("accepts a multi-file proposal updating inspected source and adding a test", async () => {
     const { github } = fakeGitHub();
     vi.mocked(github.context).mockResolvedValueOnce({ paths: ["src/lib/tasks.ts"], files: [{ path: "src/lib/tasks.ts", content: "export const tasks = [];" }] });

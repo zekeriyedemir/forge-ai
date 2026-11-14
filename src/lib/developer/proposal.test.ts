@@ -1,8 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const config = vi.hoisted(() => ({ demoMode: "false" }));
-vi.mock("@/lib/env", () => ({ serverEnv: () => ({ DEMO_MODE: config.demoMode, OPENAI_API_KEY: "test-only", OPENAI_MODEL: "test-model", OPENAI_BASE_URL: "https://example.test/v1", DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS: 8192 }) }));
-import { generateCiFixProposal, generateDeveloperProposal } from "./proposal";
+const config = vi.hoisted(() => ({ demoMode: "false", tokenParameter: "max_completion_tokens", jsonMode: "true" }));
+vi.mock("@/lib/env", () => ({ serverEnv: () => ({ DEMO_MODE: config.demoMode, OPENAI_API_KEY: "test-only", OPENAI_MODEL: "test-model", OPENAI_BASE_URL: "https://example.test/v1", OPENAI_TOKEN_PARAMETER: config.tokenParameter, OPENAI_JSON_MODE: config.jsonMode, DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS: 8192 }) }));
+import { generateCiFixProposal, generateDeveloperProposal, PROPOSAL_AI_TIMEOUT_MS } from "./proposal";
 import { DeveloperProposalError } from "./diagnostics";
 import { proposalSchema } from "./contracts";
 
@@ -11,7 +11,8 @@ const proposal = { task: "Improve home page", summary: "Render a useful welcome 
 
 const jsonResponse = (payload: unknown, status = 200) => new Response(JSON.stringify(payload), { status });
 
-beforeEach(() => { config.demoMode = "false"; vi.unstubAllGlobals(); });
+beforeEach(() => { config.demoMode = "false"; config.tokenParameter = "max_completion_tokens"; config.jsonMode = "true"; vi.unstubAllGlobals(); });
+afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("Developer structured output", () => {
   it("refuses live proposals in demo mode even when credentials are configured", async () => {
@@ -29,10 +30,73 @@ describe("Developer structured output", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it("uses configured token and JSON-mode capabilities", async () => {
+    config.tokenParameter = "max_tokens";
+    config.jsonMode = "false";
+    const fetchMock = vi.fn().mockImplementation(async () => jsonResponse({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(proposal) } }] }, 200));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await generateDeveloperProposal("Improve home page", context)).toEqual(proposal);
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.max_tokens).toBe(8192);
+    expect(body.max_completion_tokens).toBeUndefined();
+    expect(body.response_format).toBeUndefined();
+  });
+
   it("handles interrupted provider bodies without echoing response details", async () => {
     const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.error(new Error("private provider response")); } });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(stream)));
-    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ code: "UNREADABLE_RESPONSE", message: "The AI response timed out or could not be read. No GitHub changes were made." });
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ code: "UNREADABLE_RESPONSE", message: "The AI response stream was interrupted or could not be read. No GitHub changes were made." });
+  });
+
+  it("classifies a response-body timeout separately and does not retry it", async () => {
+    const controller = new AbortController();
+    vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    const fetchMock = vi.fn((_url: string, init: RequestInit) => Promise.resolve(new Response(new ReadableStream({
+      start(controller) { init.signal?.addEventListener("abort", () => controller.error(init.signal?.reason), { once: true }); },
+    }))));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({
+      stage: "ai-provider",
+      code: "TIMEOUT",
+      message: "The AI provider response timed out while being read. No GitHub changes were made.",
+    });
+    controller.abort(new DOMException("private timeout details", "TimeoutError"));
+    await result;
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("classifies a timed-out connection as TIMEOUT", async () => {
+    const controller = new AbortController();
+    vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
+    const fetchMock = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({
+      stage: "ai-provider",
+      code: "TIMEOUT",
+      message: "The AI provider request timed out. No GitHub changes were made.",
+    });
+    controller.abort(new DOMException("private timeout details", "TimeoutError"));
+    await result;
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("shares the 90-second AI deadline across a truncation retry", async () => {
+    let now = 1_000;
+    const timeouts: number[] = [];
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    vi.spyOn(AbortSignal, "timeout").mockImplementation(milliseconds => {
+      timeouts.push(milliseconds);
+      return new AbortController().signal;
+    });
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(async () => { now += 30_000; return jsonResponse({ choices: [{ finish_reason: "length" }] }); })
+      .mockResolvedValueOnce(jsonResponse({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(proposal) } }] }));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await generateDeveloperProposal("Improve home page", context)).toEqual(proposal);
+    expect(timeouts).toEqual([PROPOSAL_AI_TIMEOUT_MS, PROPOSAL_AI_TIMEOUT_MS - 30_000]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("accepts valid fenced JSON and never passes a GitHub token to the provider", async () => {
@@ -42,11 +106,12 @@ describe("Developer structured output", () => {
     const body = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(body.messages[1].content).toContain("Improve home page");
     expect(body.messages[1].content).not.toContain("ghp_");
+    expect(JSON.parse(body.messages[1].content)).not.toHaveProperty("paths");
     expect(body.max_completion_tokens).toBe(8192);
     expect(body.max_tokens).toBeUndefined();
     expect(body.response_format).toEqual({ type: "json_object" });
     const system = body.messages[0].content as string;
-    for (const required of ["files[*].path", "validationPlan: ONE JSON string", "risks: ONE JSON string", "commitMessage: ONE JSON string", "COMPLETE final text", "64000 characters"]) expect(system).toContain(required);
+    for (const required of ["files[*].path", "validationPlan: ONE JSON string", "risks: ONE JSON string", "commitMessage: ONE JSON string", "COMPLETE final text", "6144 characters"]) expect(system).toContain(required);
     const example = system.split("Valid complete example: ")[1].split("\n")[0];
     expect(proposalSchema.safeParse(JSON.parse(example)).success).toBe(true);
   });
@@ -125,6 +190,7 @@ describe("Developer structured output", () => {
     catch (error) {
       expect(error).toMatchObject({ stage: "ai-provider", code: "NO_FINAL_CONTENT" });
       expect((error as Error).message).toContain('"reasoningPresent":true');
+      expect((error as Error).message).toContain("Choose a model that emits final assistant text");
       expect((error as Error).message).not.toContain(privateValue);
     }
     expect(fetchMock).toHaveBeenCalledOnce();
@@ -154,6 +220,13 @@ describe("Developer structured output", () => {
     expect(secondRequest.messages.at(-1).content).toContain(field);
     expect(secondRequest.messages.at(-1).content).toContain("Valid complete example:");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("classifies invalid HTTP JSON separately and does not try to repair it", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response("<html>upstream error</html>", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ stage: "structured-output", code: "INVALID_JSON" });
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("repairs invalid field types while preserving valid safe fields", async () => {
@@ -215,6 +288,16 @@ describe("Developer structured output", () => {
     expect(retry.messages.at(-1).content).toContain("smallest complete implementation");
     expect(JSON.stringify(retry)).not.toContain(truncated);
     expect(JSON.stringify(retry)).not.toContain("Invalid fields:");
+    expect(JSON.parse(retry.messages[1].content).readableFiles).toHaveLength(1);
+  });
+
+  it("rejects complete files that exceed the configured output-content budget", async () => {
+    const oversized = { ...proposal, files: [{ ...proposal.files[0], content: "x".repeat(16_385) }] };
+    const fetchMock = vi.fn().mockImplementation(async () => jsonResponse({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(oversized) } }] }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ stage: "structured-output", code: "OUTPUT_TOO_LARGE" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).messages[0].content).toContain("6144 characters");
   });
 
   it("recognizes a length stop even when the provider omits the message", async () => {
@@ -289,9 +372,11 @@ describe("Developer structured output", () => {
 
   it.each([[401, "ACCESS_DENIED"], [429, "RATE_LIMITED"], [503, "HTTP_ERROR"]])("classifies provider HTTP %i as %s without reading the response body", async (status, code) => {
     const text = vi.fn(async () => "secret provider response");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status, text }));
+    const cancel = vi.fn(async () => {});
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status, text, body: { cancel } }));
     await expect(generateDeveloperProposal("Improve home page", context)).rejects.toMatchObject({ stage: "ai-provider", code });
     expect(text).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });
 

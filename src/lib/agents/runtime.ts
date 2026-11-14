@@ -4,14 +4,23 @@ import { db } from "@/lib/db";
 import { AiProviderError, demoProvider, provider } from "./provider";
 import { MetricKeyConflictError, resultSchema, type AgentResult } from "./schemas";
 import { tools } from "./tools";
-import { researchProviderConfigured, researchProviderFromEnv, ResearchProviderError } from "../research/provider";
+import { assertResearchAvailable, researchProviderConfigured, researchProviderFromEnv, ResearchProviderError } from "../research/provider";
 import { collectResearch, researchReport, type ResearchResult } from "../research/runtime";
 import { ResearchSynthesisError } from "../research/synthesis";
+import { SKIPPED_ERROR, workflowFailure, type WorkflowFailureCode } from "./workflow-status";
 
 export const sequence: AgentType[] = ["FOUNDER", "RESEARCH", "FOUNDER", "DEVELOPER", "ANALYST"];
 const runInput = z.object({ goal: z.string().trim().min(10).max(2000) });
 export class WorkflowLimitError extends Error {
   constructor() { super("Workflow limit reached. Try again later."); }
+}
+export class WorkflowPreflightError extends Error {
+  readonly code: WorkflowFailureCode;
+  constructor(code: unknown) {
+    const failure = workflowFailure(code);
+    super(failure.message);
+    this.code = failure.code;
+  }
 }
 
 async function serializable<T>(work: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
@@ -24,14 +33,30 @@ async function serializable<T>(work: (tx: Prisma.TransactionClient) => Promise<T
 }
 
 function failureDetails(error: unknown) {
-  if (error instanceof ResearchProviderError) return { code: "RESEARCH_PROVIDER", message: "We couldn't retrieve research sources. Please try again or check the research integration." };
-  if (error instanceof ResearchSynthesisError) return { code: "RESEARCH_SYNTHESIS", message: "We couldn't finish analyzing the research. Please try again." };
-  if (error instanceof AiProviderError) return { code: "AI_PROVIDER", message: "We couldn't get a complete response from the AI provider. Please try again or check your AI configuration." };
-  if (error instanceof MetricKeyConflictError) return { code: "METRIC_CONFLICT", message: "A generated metric conflicts with an existing metric. Please review your metrics and try again." };
-  return { code: error instanceof ZodError ? "INVALID_RESULT" : "EXECUTION_FAILED", message: "We couldn't complete this workflow. Please try again." };
+  if (error instanceof ResearchProviderError) return workflowFailure(error.code ?? "RESEARCH_PROVIDER");
+  if (error instanceof ResearchSynthesisError) return workflowFailure(error.code ?? "RESEARCH_SYNTHESIS");
+  if (error instanceof AiProviderError) return workflowFailure(error.code ?? "AI_PROVIDER");
+  if (error instanceof MetricKeyConflictError) return workflowFailure("METRIC_CONFLICT");
+  return workflowFailure(error instanceof ZodError ? "INVALID_RESULT" : "EXECUTION_FAILED");
 }
 
 export async function startWorkflow(projectId: string) {
+    if (process.env.DEMO_MODE !== "true") {
+      // Resume active work without repeating a search probe. Recheck inside the
+      // transaction below so concurrent starts still create only one workflow.
+      const existing = await db.agentRun.findFirst({ where: { projectId, status: { in: ["PENDING", "RUNNING"] } } });
+      if (existing) return existing.workflowId;
+      const goal = await db.businessGoal.findFirst({ where: { projectId }, orderBy: { createdAt: "desc" } });
+      if (!goal) throw new Error("Add a business goal before starting the workflow");
+      const recent = await db.agentRun.count({ where: { projectId, type: "FOUNDER", step: 0, createdAt: { gt: new Date(Date.now() - 60 * 60 * 1000) } } });
+      if (recent >= 5) throw new WorkflowLimitError();
+      try { provider(); }
+      catch { throw new WorkflowPreflightError("AI_NOT_CONFIGURED"); }
+      // No provider requests inside the database transaction and no AI call or
+      // failed history records when the search dependency is unavailable.
+      try { await assertResearchAvailable(); }
+      catch (error) { throw new WorkflowPreflightError(failureDetails(error).code); }
+    }
     return serializable(async tx => {
       const existing = await tx.agentRun.findFirst({ where: { projectId, status: { in: ["PENDING", "RUNNING"] } } });
       if (existing) return existing.workflowId;
@@ -74,7 +99,7 @@ export async function advanceWorkflow(projectId: string, workflowId: string) {
     let modelName: string;
     let result: AgentResult;
     if (liveResearch) {
-      if (!researchProviderConfigured(process.env)) throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set RESEARCH_PROVIDER=searxng with RESEARCH_SEARXNG_BASE_URL or BRAVE_SEARCH_API_KEY.");
+      if (!researchProviderConfigured(process.env)) throw new ResearchProviderError("Research provider is NOT CONFIGURED. Set RESEARCH_PROVIDER=searxng with RESEARCH_SEARXNG_BASE_URL or BRAVE_SEARCH_API_KEY.", "RESEARCH_NOT_CONFIGURED");
       if (!process.env.OPENAI_API_KEY?.trim()) throw new ResearchSynthesisError("AI provider is NOT CONFIGURED for research synthesis.");
       const selected = researchProviderFromEnv(process.env);
       research = await collectResearch(goal, selected);
@@ -127,8 +152,8 @@ export async function advanceWorkflow(projectId: string, workflowId: string) {
         try { if (researchProviderConfigured(process.env)) failedProvider = researchProviderFromEnv(process.env).name; } catch { /* Invalid configuration is itself a reportable failure. */ }
         await tx.researchSession.upsert({ where: { runId: run.id }, create: { projectId, runId: run.id, provider: failedProvider, status: "FAILED", limitations: message, completedAt: new Date() }, update: { status: "FAILED", limitations: message, completedAt: new Date() } });
       }
-      await tx.agentEvent.create({ data: { runId: run.id, kind: "failed", message } });
-      await tx.agentRun.updateMany({ where: { workflowId, projectId, status: "PENDING" }, data: { status: "FAILED", error: "Skipped because an earlier agent failed", completedAt: new Date() } });
+      await tx.agentEvent.create({ data: { runId: run.id, kind: "failed", message, data: { code } } });
+      await tx.agentRun.updateMany({ where: { workflowId, projectId, status: "PENDING" }, data: { status: "FAILED", error: SKIPPED_ERROR, completedAt: new Date() } });
     });
     throw error;
   }

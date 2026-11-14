@@ -1,0 +1,12 @@
+# Local research only; the container port is bound to loopback.
+# scripts/start-research.mjs creates a private copy with a random secret.
+use_default_settings: true
+search:
+  formats:
+    - html
+    - json
+server:
+  secret_key: "__FORGE_SEARXNG_SECRET__"
+  limiter: false
+  public_instance: false
+  image_proxy: false

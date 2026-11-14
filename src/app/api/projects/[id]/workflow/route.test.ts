@@ -3,9 +3,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({ user: vi.fn(), ownerProject: vi.fn(), findRun: vi.fn(), findRuns: vi.fn(), start: vi.fn(), advance: vi.fn() }));
 vi.mock("@/lib/access", () => ({ currentUserId: mocks.user, projectForOwner: mocks.ownerProject }));
 vi.mock("@/lib/db", () => ({ db: { agentRun: { findFirst: mocks.findRun, findMany: mocks.findRuns } } }));
-vi.mock("@/lib/agents/runtime", () => ({ startWorkflow: mocks.start, advanceWorkflow: mocks.advance, WorkflowLimitError: class WorkflowLimitError extends Error { constructor() { super("Workflow limit reached. Try again later."); } } }));
+vi.mock("@/lib/agents/runtime", () => ({
+  startWorkflow: mocks.start,
+  advanceWorkflow: mocks.advance,
+  WorkflowLimitError: class WorkflowLimitError extends Error { constructor() { super("Workflow limit reached. Try again later."); } },
+  WorkflowPreflightError: class WorkflowPreflightError extends Error { constructor(readonly code: unknown) { super("Preflight failed"); } },
+}));
 import { POST, PATCH } from "./route";
-import { WorkflowLimitError } from "@/lib/agents/runtime";
+import { WorkflowLimitError, WorkflowPreflightError } from "@/lib/agents/runtime";
+import { SKIPPED_ERROR } from "@/lib/agents/workflow-status";
 
 const projectId = "00000000-0000-4000-8000-000000000001";
 const context = { params: Promise.resolve({ id: projectId }) };
@@ -48,6 +54,34 @@ describe("workflow route authorization", () => {
     expect(await response.json()).toEqual({ error: "Workflow limit reached. Try again later." });
   });
 
+  it("returns a safe actionable 503 when live preflight fails", async () => {
+    mocks.user.mockResolvedValue("user-id");
+    mocks.ownerProject.mockResolvedValue({ id: projectId });
+    const failure = new WorkflowPreflightError("RESEARCH_UNAVAILABLE");
+    failure.message = "Connection refused at https://private-key@internal-host";
+    mocks.start.mockRejectedValue(failure);
+
+    const response = await POST(new Request("http://localhost", { method: "POST" }), context);
+    const body = await response.json();
+
+    expect(response.status).toBe(503);
+    expect(body.code).toBe("RESEARCH_UNAVAILABLE");
+    expect(body.error).toContain("npm run research:start");
+    expect(JSON.stringify(body)).not.toContain("private-key");
+    expect(mocks.advance).not.toHaveBeenCalled();
+  });
+
+  it("does not echo an unknown preflight code or message", async () => {
+    mocks.user.mockResolvedValue("user-id");
+    mocks.ownerProject.mockResolvedValue({ id: projectId });
+    mocks.start.mockRejectedValue(new WorkflowPreflightError("private-key"));
+
+    const response = await POST(new Request("http://localhost", { method: "POST" }), context);
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ code: "EXECUTION_FAILED", error: "We couldn't complete this workflow. Please try again." });
+  });
+
   it.each([POST, PATCH])("handles database failures in ownership prechecks with safe JSON", async handler => {
     mocks.user.mockResolvedValue("user-id");
     mocks.ownerProject.mockRejectedValue(new Error("postgresql://private-credential@host/db"));
@@ -83,5 +117,73 @@ describe("workflow route authorization", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ runs });
     expect(mocks.advance).toHaveBeenCalledWith(projectId, workflowId);
+  });
+
+  it("returns a persisted research failure as workflow state and preserves skipped steps", async () => {
+    mocks.user.mockResolvedValue("user-id");
+    mocks.ownerProject.mockResolvedValue({ id: projectId });
+    mocks.findRun.mockResolvedValue({ id: "research-run" });
+    mocks.advance.mockRejectedValue(new Error("Raw search failure with private-key"));
+    mocks.findRuns.mockResolvedValue([
+      { id: "founder-run", type: "FOUNDER", status: "COMPLETED", error: null, events: [] },
+      { id: "research-run", type: "RESEARCH", status: "FAILED", error: "Raw stored error with private-key", events: [{ kind: "failed", data: { code: "RESEARCH_UNAVAILABLE" } }] },
+      { id: "developer-run", type: "DEVELOPER", status: "FAILED", error: SKIPPED_ERROR, events: [] },
+    ]);
+    const workflowId = crypto.randomUUID();
+
+    const response = await PATCH(new Request("http://localhost", { method: "PATCH", body: JSON.stringify({ workflowId }) }), context);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.failure).toMatchObject({ code: "RESEARCH_UNAVAILABLE", message: expect.stringContaining("npm run research:start") });
+    expect(body.runs).toEqual([
+      { id: "founder-run", type: "FOUNDER", status: "COMPLETED", error: null },
+      { id: "research-run", type: "RESEARCH", status: "FAILED", errorCode: "RESEARCH_UNAVAILABLE", error: body.failure.message },
+      { id: "developer-run", type: "DEVELOPER", status: "FAILED", error: SKIPPED_ERROR },
+    ]);
+    expect(mocks.findRuns).toHaveBeenCalledWith(expect.objectContaining({ where: { projectId, workflowId }, orderBy: { step: "asc" } }));
+    expect(JSON.stringify([body, vi.mocked(console.error).mock.calls])).not.toContain("private-key");
+  });
+
+  it("sanitizes arbitrary errors in historical failed runs", async () => {
+    mocks.user.mockResolvedValue("user-id");
+    mocks.ownerProject.mockResolvedValue({ id: projectId });
+    mocks.findRun.mockResolvedValue({ id: "old-run" });
+    mocks.findRuns.mockResolvedValue([{ id: "old-run", type: "RESEARCH", status: "FAILED", error: "postgresql://private-key@internal-host/database", events: [{ kind: "failed", data: { code: "private-key" } }] }]);
+
+    const response = await PATCH(new Request("http://localhost", { method: "PATCH", body: JSON.stringify({ workflowId: crypto.randomUUID() }) }), context);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.failure).toEqual({ code: "EXECUTION_FAILED", message: "We couldn't complete this workflow. Please try again." });
+    expect(body.runs[0].error).toBe(body.failure.message);
+    expect(JSON.stringify(body)).not.toContain("private-key");
+  });
+
+  it("keeps a failure to persist agent state as a retryable server error", async () => {
+    mocks.user.mockResolvedValue("user-id");
+    mocks.ownerProject.mockResolvedValue({ id: projectId });
+    mocks.findRun.mockResolvedValue({ id: "research-run" });
+    mocks.advance.mockRejectedValue(new Error("Database unavailable with private-key"));
+    mocks.findRuns.mockResolvedValue([{ id: "research-run", type: "RESEARCH", status: "RUNNING", error: null, events: [] }]);
+
+    const response = await PATCH(new Request("http://localhost", { method: "PATCH", body: JSON.stringify({ workflowId: crypto.randomUUID() }) }), context);
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "We couldn't complete this workflow. Please try again." });
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain("private-key");
+  });
+
+  it("returns safe JSON if reading persisted workflow state fails", async () => {
+    mocks.user.mockResolvedValue("user-id");
+    mocks.ownerProject.mockResolvedValue({ id: projectId });
+    mocks.findRun.mockResolvedValue({ id: "research-run" });
+    mocks.findRuns.mockRejectedValue(new Error("Database unavailable with private-key"));
+
+    const response = await PATCH(new Request("http://localhost", { method: "PATCH", body: JSON.stringify({ workflowId: crypto.randomUUID() }) }), context);
+
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: "We couldn't complete this workflow. Please try again." });
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain("private-key");
   });
 });
