@@ -6,6 +6,7 @@ import { ciFixSchema, generatedProposalSchema, proposalSchema, featureBranch, sa
 import { DeveloperGitHubError, developerGitHub, type DeveloperGitHub, type PullInfo } from "./github";
 import { generateCiFixProposal, generateDeveloperProposal } from "./proposal";
 import { DeveloperProposalError, RepositoryValidationError, schemaFields, type ProposalFailureStage } from "./diagnostics";
+import { assertUserLimit, UserLimitError } from "../user-limits";
 
 export class DeveloperFlowError extends Error {}
 class StaleAdoptionError extends DeveloperFlowError {}
@@ -85,12 +86,14 @@ export async function createDeveloperProposal(projectId: string, taskId: string,
     const branch = featureBranch(task.title, id);
     try {
       return await db.$transaction(async tx => {
+        await assertUserLimit(tx, userId, "developerProposals");
         const execution = await tx.developerExecution.create({ data: { id, projectId, taskId, runId: task.sourceRunId, repositoryId: linked.id, repositoryGithubId: linked.githubId, repositoryFullName: linked.fullName, branch, targetBranch: target, baseSha, proposal: proposal as Prisma.InputJsonValue, inspectedPaths: context.files.map(file => file.path), validationSummary: "Static path, size, and structured-output validation passed. Repository tests and CI have not run." } });
         await tx.approvalRequest.create({ data: { projectId, executionId: id, runId: task.sourceRunId, action: "IMPLEMENT", requestedById: userId, description: `Implement ${proposal.task} in ${linked.fullName} on ${branch}`, payload: { branch, target, baseSha, files: proposal.files.map(file => ({ path: file.path, operation: file.operation, reason: file.reason })), summary: proposal.summary, risks: proposal.risks, validationPlan: proposal.validationPlan, validationExpectation: proposal.validationExpectation } } });
         await tx.activityEvent.create({ data: { projectId, kind: "developer", message: `Developer proposal awaiting approval: ${proposal.task}` } });
         return execution;
-      });
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     } catch (error) {
+      if (error instanceof UserLimitError) throw error;
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
         const winner = await db.developerExecution.findFirst({ where: { projectId, taskId } });
         if (winner) return winner;
@@ -98,6 +101,7 @@ export async function createDeveloperProposal(projectId: string, taskId: string,
       throw new DeveloperProposalError("database", "PERSISTENCE_FAILED", "Could not save the proposal and approval request. No GitHub changes were made.");
     }
   } catch (error) {
+    if (error instanceof UserLimitError) throw error;
     const failure = error instanceof DeveloperProposalError ? error : new DeveloperProposalError("database", "UNEXPECTED_FAILURE", "Proposal processing failed before approval. No GitHub changes were made.");
     await recordProposalFailure(projectId, taskId, failure);
     throw failure;

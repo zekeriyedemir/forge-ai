@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   findRun: vi.fn(), countRuns: vi.fn(), createRun: vi.fn(), updateMany: vi.fn(), transaction: vi.fn(),
+  findProject: vi.fn(), assertUserLimit: vi.fn(),
   findGoal: vi.fn(), upsertAgent: vi.fn(), createEvent: vi.fn(), createActivity: vi.fn(),
   readContext: vi.fn(), createTask: vi.fn(), createReport: vi.fn(), saveMetric: vi.fn(), generate: vi.fn(),
   collectResearch: vi.fn(), researchReport: vi.fn(), createSession: vi.fn(), createSource: vi.fn(), createFinding: vi.fn(), upsertSession: vi.fn(), findSession: vi.fn(),
@@ -11,6 +12,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/lib/db", () => {
   const tx = {
     agentRun: { findFirst: mocks.findRun, count: mocks.countRuns, create: mocks.createRun, updateMany: mocks.updateMany },
+    project: { findFirst: mocks.findProject },
     businessGoal: { findFirst: mocks.findGoal }, agent: { upsert: mocks.upsertAgent },
     agentEvent: { create: mocks.createEvent }, activityEvent: { create: mocks.createActivity },
     researchSession: { create: mocks.createSession, upsert: mocks.upsertSession, findFirst: mocks.findSession },
@@ -30,6 +32,7 @@ vi.mock("../research/provider", () => ({
   braveResearchProvider: () => ({ name: "mock-search" }),
 }));
 vi.mock("../research/runtime", () => ({ collectResearch: mocks.collectResearch, researchReport: mocks.researchReport }));
+vi.mock("../user-limits", () => ({ assertUserLimit: mocks.assertUserLimit, UserLimitError: class UserLimitError extends Error {} }));
 
 import { AiProviderError } from "./provider";
 import { advanceWorkflow, startWorkflow, WorkflowPreflightError } from "./runtime";
@@ -50,6 +53,8 @@ beforeEach(() => {
   mocks.createProvider.mockReset().mockReturnValue({ name: "mock", model: "test", generate: mocks.generate });
   vi.spyOn(console, "error").mockImplementation(() => {});
   mocks.findRun.mockResolvedValue(null);
+  mocks.findProject.mockResolvedValue({ id: projectId });
+  mocks.assertUserLimit.mockResolvedValue(undefined);
   mocks.countRuns.mockResolvedValue(0);
   mocks.findGoal.mockResolvedValue({ statement: "Build a useful service" });
   mocks.upsertAgent.mockResolvedValue({ id: "agent-id" });
@@ -67,7 +72,7 @@ describe("workflow persistence", () => {
     vi.stubEnv("DEMO_MODE", "false");
     mocks.assertResearchAvailable.mockRejectedValue(new ResearchProviderError("connect failed at https://private-key@search.invalid", "RESEARCH_UNAVAILABLE"));
 
-    const failure = await startWorkflow(projectId).catch(error => error);
+    const failure = await startWorkflow(projectId, "user-id").catch(error => error);
 
     expect(failure).toBeInstanceOf(WorkflowPreflightError);
     expect(failure).toMatchObject({ code: "RESEARCH_UNAVAILABLE" });
@@ -87,7 +92,7 @@ describe("workflow persistence", () => {
     mocks.createProvider.mockImplementation(() => { throw new Error("AI unavailable"); });
     mocks.assertResearchAvailable.mockRejectedValue(new ResearchProviderError("Search unavailable"));
 
-    expect(await startWorkflow(projectId)).toBe(workflowId);
+    expect(await startWorkflow(projectId, "user-id")).toBe(workflowId);
     expect(mocks.createProvider).not.toHaveBeenCalled();
     expect(mocks.assertResearchAvailable).not.toHaveBeenCalled();
     expect(mocks.createRun).not.toHaveBeenCalled();
@@ -100,7 +105,7 @@ describe("workflow persistence", () => {
       expect(mocks.createRun).not.toHaveBeenCalled();
     });
 
-    await startWorkflow(projectId);
+    await startWorkflow(projectId, "user-id");
 
     expect(mocks.assertResearchAvailable).toHaveBeenCalledOnce();
     expect(mocks.createRun).toHaveBeenCalledTimes(5);
@@ -111,14 +116,14 @@ describe("workflow persistence", () => {
     vi.stubEnv("DEMO_MODE", "false");
     mocks.createProvider.mockImplementation(() => { throw new Error("API key private-key is invalid"); });
 
-    await expect(startWorkflow(projectId)).rejects.toMatchObject({ code: "AI_NOT_CONFIGURED" });
+    await expect(startWorkflow(projectId, "user-id")).rejects.toMatchObject({ code: "AI_NOT_CONFIGURED" });
     expect(mocks.assertResearchAvailable).not.toHaveBeenCalled();
     expect(mocks.createRun).not.toHaveBeenCalled();
   });
 
   it("keeps demo workflows available offline without probing live research", async () => {
     mocks.assertResearchAvailable.mockRejectedValue(new ResearchProviderError("Offline"));
-    await startWorkflow(projectId);
+    await startWorkflow(projectId, "user-id");
     mocks.findRun.mockResolvedValue(pendingRun);
     await advanceWorkflow(projectId, workflowId);
 
@@ -130,37 +135,37 @@ describe("workflow persistence", () => {
   });
 
   it("creates ordered runs, reuses an active workflow, and allows a new one after failure", async () => {
-    const firstWorkflow = await startWorkflow(projectId);
+    const firstWorkflow = await startWorkflow(projectId, "user-id");
     expect(mocks.createRun).toHaveBeenCalledTimes(5);
     expect(mocks.createRun.mock.calls.map(call => call[0].data.type)).toEqual(["FOUNDER", "RESEARCH", "FOUNDER", "DEVELOPER", "ANALYST"]);
     expect(mocks.createRun.mock.calls.every(call => call[0].data.workflowId === firstWorkflow)).toBe(true);
     mocks.findRun.mockResolvedValueOnce({ workflowId: firstWorkflow });
-    expect(await startWorkflow(projectId)).toBe(firstWorkflow);
+    expect(await startWorkflow(projectId, "user-id")).toBe(firstWorkflow);
     expect(mocks.createRun).toHaveBeenCalledTimes(5);
-    expect(await startWorkflow(projectId)).not.toBe(firstWorkflow);
+    expect(await startWorkflow(projectId, "user-id")).not.toBe(firstWorkflow);
     expect(mocks.createRun).toHaveBeenCalledTimes(10);
   });
 
   it("does not record a queued workflow when run creation fails", async () => {
     mocks.createRun.mockRejectedValueOnce(new Error("Database write failed"));
-    await expect(startWorkflow(projectId)).rejects.toThrow("Database write failed");
+    await expect(startWorkflow(projectId, "user-id")).rejects.toThrow("Database write failed");
     expect(mocks.createActivity).not.toHaveBeenCalled();
   });
 
   it("enforces the hourly limit within the same serializable transaction as new runs", async () => {
     mocks.countRuns.mockResolvedValue(5);
-    await expect(startWorkflow(projectId)).rejects.toThrow("Workflow limit reached");
+    await expect(startWorkflow(projectId, "user-id")).rejects.toThrow("Workflow limit reached");
     expect(mocks.transaction).toHaveBeenCalledWith(expect.any(Function), expect.objectContaining({ isolationLevel: "Serializable" }));
     expect(mocks.createRun).not.toHaveBeenCalled();
     mocks.findRun.mockResolvedValue({ workflowId });
-    expect(await startWorkflow(projectId)).toBe(workflowId);
+    expect(await startWorkflow(projectId, "user-id")).toBe(workflowId);
     expect(mocks.countRuns).toHaveBeenCalledOnce();
   });
 
   it("retries serialization conflicts and reuses the concurrently queued workflow", async () => {
     mocks.findRun.mockResolvedValueOnce(null).mockResolvedValueOnce({ workflowId });
     mocks.createRun.mockRejectedValueOnce({ code: "P2034" });
-    expect(await startWorkflow(projectId)).toBe(workflowId);
+    expect(await startWorkflow(projectId, "user-id")).toBe(workflowId);
     expect(mocks.transaction).toHaveBeenCalledTimes(2);
     expect(mocks.createActivity).not.toHaveBeenCalled();
   });

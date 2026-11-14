@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ user: vi.fn(), requireUser: vi.fn(), workspace: vi.fn(), ownerProject: vi.fn(), deleteMany: vi.fn(), createProject: vi.fn(), updateProject: vi.fn(), updateTask: vi.fn(), revalidate: vi.fn(), redirect: vi.fn() }));
+const mocks = vi.hoisted(() => ({ user: vi.fn(), requireUser: vi.fn(), workspace: vi.fn(), ownerProject: vi.fn(), deleteMany: vi.fn(), createProject: vi.fn(), transaction: vi.fn(), updateProject: vi.fn(), updateTask: vi.fn(), assertUserLimit: vi.fn(), revalidate: vi.fn(), redirect: vi.fn() }));
 vi.mock("@/lib/access", () => ({ authenticatedUserId: mocks.user, projectForOwner: mocks.ownerProject, requireUser: mocks.requireUser, workspaceForUser: mocks.workspace }));
-vi.mock("@/lib/db", () => ({ db: { project: { deleteMany: mocks.deleteMany, create: mocks.createProject, update: mocks.updateProject }, task: { update: mocks.updateTask } } }));
+vi.mock("@/lib/db", () => ({ db: { project: { deleteMany: mocks.deleteMany, create: mocks.createProject, update: mocks.updateProject }, task: { update: mocks.updateTask }, $transaction: mocks.transaction } }));
+vi.mock("@/lib/user-limits", () => ({ assertUserLimit: mocks.assertUserLimit, UserLimitError: class UserLimitError extends Error { constructor() { super("Project limit reached."); } } }));
 vi.mock("@/lib/validation", () => import("../lib/validation"));
 vi.mock("next/cache", () => ({ revalidatePath: mocks.revalidate }));
 vi.mock("next/navigation", () => ({ redirect: (path: string) => { mocks.redirect(path); throw new Error(`redirect:${path}`); } }));
@@ -10,7 +11,7 @@ import { addGoal, createProject, deleteProject, updateTask } from "./actions";
 
 const projectId = "00000000-0000-4000-8000-000000000001";
 function confirmation(value: string) { const form = new FormData(); form.set("confirmation", value); return form; }
-beforeEach(() => { vi.clearAllMocks(); mocks.ownerProject.mockResolvedValue({ id: projectId, name: "Atlas" }); mocks.deleteMany.mockResolvedValue({ count: 1 }); mocks.requireUser.mockResolvedValue("owner-id"); mocks.workspace.mockResolvedValue({ id: "workspace-id" }); mocks.createProject.mockResolvedValue({ id: projectId }); });
+beforeEach(() => { vi.clearAllMocks(); mocks.ownerProject.mockResolvedValue({ id: projectId, name: "Atlas" }); mocks.deleteMany.mockResolvedValue({ count: 1 }); mocks.requireUser.mockResolvedValue("owner-id"); mocks.workspace.mockResolvedValue({ id: "workspace-id" }); mocks.createProject.mockResolvedValue({ id: projectId }); mocks.assertUserLimit.mockResolvedValue(undefined); mocks.transaction.mockImplementation((work: (tx: { project: { create: typeof mocks.createProject } }) => Promise<unknown>) => work({ project: { create: mocks.createProject } })); });
 
 describe("project and task mutations", () => {
   it("validates and trims project creation before attaching it to the caller's owned workspace", async () => {
@@ -18,6 +19,8 @@ describe("project and task mutations", () => {
     form.set("name", "  Atlas  "); form.set("goal", "  Validate the product with five customers  "); form.set("description", "Initial research");
     await expect(createProject(form)).rejects.toThrow(`redirect:/dashboard/projects/${projectId}`);
     expect(mocks.workspace).toHaveBeenCalledWith("owner-id");
+    expect(mocks.transaction).toHaveBeenCalledWith(expect.any(Function), { isolationLevel: "Serializable" });
+    expect(mocks.assertUserLimit).toHaveBeenCalledWith(expect.any(Object), "owner-id", "projects");
     expect(mocks.createProject).toHaveBeenCalledWith({ data: { workspaceId: "workspace-id", name: "Atlas", description: "Initial research", goals: { create: { statement: "Validate the product with five customers" } }, activity: { create: { kind: "project", message: "Project created" } } } });
   });
 

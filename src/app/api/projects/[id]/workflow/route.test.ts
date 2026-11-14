@@ -6,7 +6,7 @@ vi.mock("@/lib/db", () => ({ db: { agentRun: { findFirst: mocks.findRun, findMan
 vi.mock("@/lib/agents/runtime", () => ({
   startWorkflow: mocks.start,
   advanceWorkflow: mocks.advance,
-  WorkflowLimitError: class WorkflowLimitError extends Error { constructor() { super("Workflow limit reached. Try again later."); } },
+  WorkflowLimitError: class WorkflowLimitError extends Error { constructor() { super("Workflow limit reached for this project. Wait an hour before starting another workflow."); } },
   WorkflowPreflightError: class WorkflowPreflightError extends Error { constructor(readonly code: unknown) { super("Preflight failed"); } },
 }));
 import { POST, PATCH } from "./route";
@@ -42,7 +42,7 @@ describe("workflow route authorization", () => {
     const response = await POST(new Request(`http://localhost/api/projects/${projectId}/workflow`, { method: "POST" }), context);
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ workflowId: "workflow-id" });
-    expect(mocks.start).toHaveBeenCalledWith(projectId);
+    expect(mocks.start).toHaveBeenCalledWith(projectId, "user-id");
   });
 
   it("returns an actionable rate-limit response without exposing internal errors", async () => {
@@ -51,7 +51,7 @@ describe("workflow route authorization", () => {
     mocks.start.mockRejectedValue(new WorkflowLimitError());
     const response = await POST(new Request("http://localhost", { method: "POST" }), context);
     expect(response.status).toBe(429);
-    expect(await response.json()).toEqual({ error: "Workflow limit reached. Try again later." });
+    expect(await response.json()).toEqual({ error: "Workflow limit reached for this project. Wait an hour before starting another workflow." });
   });
 
   it("returns a safe actionable 503 when live preflight fails", async () => {

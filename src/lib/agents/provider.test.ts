@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const config = vi.hoisted(() => ({ demoMode: "true", apiKey: "", tokenParameter: "max_completion_tokens", jsonMode: "true" }));
-vi.mock("@/lib/env", () => ({ serverEnv: () => ({ DATABASE_URL: "postgresql://localhost/forge", AUTH_SECRET: "a".repeat(32), DEMO_MODE: config.demoMode, OPENAI_API_KEY: config.apiKey, OPENAI_BASE_URL: "https://example.test/v1/", OPENAI_MODEL: "test-model", OPENAI_TOKEN_PARAMETER: config.tokenParameter, OPENAI_JSON_MODE: config.jsonMode }) }));
+const config = vi.hoisted(() => ({ demoMode: "true", apiKey: "", tokenParameter: "max_completion_tokens", jsonMode: "true", proposalModel: undefined as string | undefined }));
+vi.mock("@/lib/env", () => ({ serverEnv: () => ({ DATABASE_URL: "postgresql://localhost/forge", AUTH_SECRET: "a".repeat(32), DEMO_MODE: config.demoMode, OPENAI_API_KEY: config.apiKey, OPENAI_BASE_URL: "https://example.test/v1/", OPENAI_MODEL: "test-model", OPENAI_PROPOSAL_MODEL: config.proposalModel, OPENAI_TOKEN_PARAMETER: config.tokenParameter, OPENAI_JSON_MODE: config.jsonMode }) }));
 import { AGENT_REQUEST_TIMEOUT_MS, AiProviderError, demoProvider, resultSchema, provider } from "./provider";
 
 const jsonResponse = (payload: unknown, status = 200) => new Response(JSON.stringify(payload), { status });
 
-beforeEach(() => { config.demoMode = "true"; config.apiKey = ""; config.tokenParameter = "max_completion_tokens"; config.jsonMode = "true"; vi.unstubAllGlobals(); vi.spyOn(console, "warn").mockImplementation(() => {}); });
+beforeEach(() => { config.demoMode = "true"; config.apiKey = ""; config.tokenParameter = "max_completion_tokens"; config.jsonMode = "true"; config.proposalModel = undefined; vi.unstubAllGlobals(); vi.spyOn(console, "warn").mockImplementation(() => {}); });
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("agent provider", () => {
@@ -53,6 +53,18 @@ describe("agent provider", () => {
     expect(request.response_format).toEqual({ type: "json_object" });
     expect(request.messages[0].content).toContain("Metric keys must be unique ASCII lowercase snake_case");
     expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  it("keeps ordinary workflow agents on OPENAI_MODEL when a proposal model is configured", async () => {
+    config.demoMode = "false";
+    config.apiKey = "test-only-key";
+    config.proposalModel = "proposal-only-model";
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ choices: [{ message: { content: JSON.stringify({ summary: "Ready", tasks: [], reports: [], metrics: [] }) } }] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await provider().generate("FOUNDER", "Build a useful service", "");
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).model).toBe("test-model");
   });
 
   it("omits JSON mode when disabled for a model/API that does not support it", async () => {

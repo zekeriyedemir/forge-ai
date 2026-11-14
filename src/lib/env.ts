@@ -1,5 +1,11 @@
 import { z } from "zod";
 
+const userLimitSchema = z.object({
+  MAX_PROJECTS_PER_USER: z.coerce.number().int().min(1).max(1000).default(10),
+  MAX_WORKFLOW_STARTS_PER_USER_PER_DAY: z.coerce.number().int().min(1).max(1000).default(20),
+  MAX_DEVELOPER_PROPOSALS_PER_USER_PER_DAY: z.coerce.number().int().min(1).max(1000).default(5),
+});
+
 const schema = z.object({
   DATABASE_URL: z.url().regex(/^postgres(?:ql)?:\/\//),
   DIRECT_URL: z.url().regex(/^postgres(?:ql)?:\/\//).optional(),
@@ -9,6 +15,8 @@ const schema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.url().regex(/^https?:\/\//).optional(),
   OPENAI_MODEL: z.string().default("gpt-4o-mini"),
+  OPENAI_PROPOSAL_MODEL: z.string().trim().min(1).optional(),
+  ...userLimitSchema.shape,
   OPENAI_TOKEN_PARAMETER: z.enum(["max_completion_tokens", "max_tokens"]).default("max_completion_tokens"),
   OPENAI_JSON_MODE: z.enum(["true", "false"]).default("true"),
   RESEARCH_PROVIDER: z.enum(["auto", "searxng", "brave"]).default("auto"),
@@ -20,4 +28,8 @@ const schema = z.object({
 
 export function serverEnv() {
   return schema.parse(process.env);
+}
+
+export function userLimits() {
+  return userLimitSchema.parse(process.env);
 }

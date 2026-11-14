@@ -1,5 +1,33 @@
 import { test, expect } from "./fixtures";
 
+test("nonce CSP and HSTS headers allow the Next.js demo to hydrate", async ({ page }) => {
+  const violations: string[] = [];
+  await page.addInitScript(() => {
+    const target = window as Window & { cspViolations?: string[] };
+    target.cspViolations = [];
+    window.addEventListener("securitypolicyviolation", event => {
+      target.cspViolations?.push(`${event.effectiveDirective}: ${event.blockedURI} (${event.sourceFile})`);
+    });
+  });
+  page.on("console", message => {
+    if (message.type() === "error" && message.text().toLowerCase().includes("content security policy")) violations.push(message.text());
+  });
+  const response = await page.goto("/demo");
+  const headers = response?.headers() ?? {};
+  const policy = headers["content-security-policy"] ?? "";
+  expect(policy).toMatch(/script-src[^;]*'nonce-[^']+'/);
+  expect(policy).toContain("style-src-attr 'unsafe-inline'");
+  expect(policy).toContain("form-action 'self' https://github.com");
+  expect(policy).toContain("frame-ancestors 'none'");
+  expect(headers["strict-transport-security"]).toContain("max-age=63072000");
+  await expect(page.getByRole("tab", { name: "Tasks", exact: true })).toBeVisible();
+  await page.getByRole("tab", { name: "Tasks", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Build the repository overview" })).toBeVisible();
+  const cspViolations = await page.evaluate(() => (window as Window & { cspViolations?: string[] }).cspViolations ?? []);
+  expect(cspViolations).toEqual([]);
+  expect(violations).toEqual([]);
+});
+
 test("project workflow persists outputs and owner can safely delete it", async ({ page, signedInUser }) => {
   test.setTimeout(120_000);
   await page.goto("/dashboard/projects");

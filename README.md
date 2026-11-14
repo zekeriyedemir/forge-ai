@@ -62,6 +62,8 @@ Next.js 16 · React 19 · TypeScript · Tailwind CSS 4 · PostgreSQL / Neon · P
 
 Authorization is enforced on the server and repeated inside critical database mutations. A failed structured response cannot leave partially saved tasks or reports. Workflow start uses serializable transactions, execution uses database claims, and provider responses have time and size limits. Integration tests exercise real PostgreSQL persistence and cascading deletion; browser tests cover project creation, workflow results, ownership boundaries, and deletion.
 
+Per-user limits protect database-backed project creation, workflow starts, and Developer proposals; they default to 10 projects, 20 workflow starts per 24 hours, and 5 proposals per 24 hours. OAuth access and refresh tokens are encrypted at rest with `TOKEN_ENCRYPTION_KEY`. CSP uses a per-request nonce and HSTS is enabled for HTTPS deployments.
+
 ## Running locally
 
 Use **Node.js 22+** and PostgreSQL 16. Docker is optional for the application, but provides a convenient local database.
@@ -92,12 +94,17 @@ Keep values in ignored `.env` files or your host's secret settings. See [.env.ex
 | `DIRECT_URL` | Direct PostgreSQL connection for Prisma migrations. |
 | `AUTH_SECRET` | Random session secret of at least 32 characters. |
 | `AUTH_GITHUB_ID`, `AUTH_GITHUB_SECRET` | GitHub OAuth application credentials. |
+| `TOKEN_ENCRYPTION_KEY` | Required for GitHub OAuth token storage; generate with `openssl rand -base64 32`, and keep stable and private. |
 | `AUTH_URL` | Optional Auth.js URL override; normally inferred. |
 | `AUTH_TRUST_HOST` | Set `true` only behind a trusted self-hosted proxy; inferred on Vercel. |
 | `DEMO_MODE` | Default `false`; `true` selects deterministic AI and enables a shared local development account. Production never grants anonymous workspace access. |
+| `MAX_PROJECTS_PER_USER` | Maximum projects per user; default `10`. |
+| `MAX_WORKFLOW_STARTS_PER_USER_PER_DAY` | Maximum workflow starts per user in a rolling 24-hour window; default `20`. The existing per-project hourly cap also applies. |
+| `MAX_DEVELOPER_PROPOSALS_PER_USER_PER_DAY` | Maximum Developer proposals per user in a rolling 24-hour window; default `5`. |
 | `OPENAI_API_KEY` | Server-only credential for live AI; not needed by `/demo` or deterministic mode. |
 | `OPENAI_BASE_URL` | Compatible API base; defaults to `https://api.openai.com/v1`. Set to `https://openrouter.ai/api/v1` when using OpenRouter. |
 | `OPENAI_MODEL` | Model identifier at the configured API; defaults to `gpt-4o-mini`. Choose one that returns final assistant text; JSON mode alone cannot make a reasoning-only model usable. |
+| `OPENAI_PROPOSAL_MODEL` | Optional Developer proposal/correction model; defaults to `OPENAI_MODEL`. Workflow and Research continue using `OPENAI_MODEL`. |
 | `OPENAI_TOKEN_PARAMETER` | `max_completion_tokens` (default) or `max_tokens`, according to the configured provider/model. |
 | `OPENAI_JSON_MODE` | `true` (default) sends Chat Completions JSON mode; set `false` only if the selected model/API does not support it. Forge still validates returned JSON. |
 | `RESEARCH_PROVIDER` | `auto`, `searxng`, or `brave`. Auto prefers configured SearXNG. |
@@ -129,7 +136,7 @@ Unit tests mock external providers and make no paid AI requests. Browser and int
 
 ## Security
 
-Secrets are ignored by Git and excluded from the Docker build context. Session identities and project ownership are checked server-side; inaccessible project pages show a not-found boundary. Project deletion requires its exact name and cascades through project-owned records. GitHub writes and merges need separate approvals; Forge does not execute model-generated shell commands. Research retrieval rejects private network destinations. The public sample grants no database or integration access. See [security details](docs/security.md).
+Secrets are ignored by Git and excluded from the Docker build context. Session identities and project ownership are checked server-side; inaccessible project pages show a not-found boundary. Project deletion requires its exact name and cascades through project-owned records. GitHub writes and merges need separate approvals; Forge does not execute model-generated shell commands. Research retrieval rejects private network destinations. The public sample grants no database or integration access. GitHub tokens are encrypted at rest, and production responses use nonce-based CSP and HSTS. See [security details](docs/security.md).
 
 ## Project structure
 
