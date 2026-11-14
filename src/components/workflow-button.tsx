@@ -37,7 +37,7 @@ export function WorkflowButton({ projectId }: { projectId: string }) {
         const start = await fetch(`/api/projects/${projectId}/workflow`, { method: "POST", signal: AbortSignal.timeout(125_000) });
         const data = await start.json().catch(() => null);
         if (!start.ok) {
-          throw new Error(data?.code ? workflowFailure(data.code).message : start.status === 429 ? "Your workspace is busy. Wait for the current workflow, then try again." : start.status === 401 || start.status === 404 ? "Sign in with an account that owns this project to run its workflow." : "We couldn’t start your workflow. Check that this project has a goal, then try again.");
+          throw new Error(data?.code ? workflowFailure(data.code).message : start.status === 429 && typeof data?.error === "string" ? data.error : start.status === 429 ? "Your workspace is busy. Wait for the current workflow, then try again." : start.status === 401 || start.status === 404 ? "Sign in with an account that owns this project to run its workflow." : "We couldn’t start your workflow. Check that this project has a goal, then try again.");
         }
         if (!data || typeof data.workflowId !== "string" || !data.workflowId) throw new Error("We couldn’t confirm the workflow started. Refresh the project before trying again.");
         workflowId.current = data.workflowId;

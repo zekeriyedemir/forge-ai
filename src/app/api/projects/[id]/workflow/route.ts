@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { currentUserId, projectForOwner } from "@/lib/access";
 import { advanceWorkflow, startWorkflow, WorkflowLimitError, WorkflowPreflightError } from "@/lib/agents/runtime";
+import { UserLimitError } from "@/lib/user-limits";
 import { runFailure, runPresentation, SKIPPED_ERROR, workflowFailure } from "@/lib/agents/workflow-status";
 import { db } from "@/lib/db";
 import { z } from "zod";
@@ -14,11 +15,12 @@ export async function POST(_: Request, { params }: { params: Promise<{ id: strin
     const userId = await currentUserId();
     if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     if (!await projectForOwner(id, userId)) return NextResponse.json({ error: "Not found" }, { status: 404 });
-    const workflowId = await startWorkflow(id);
+    const workflowId = await startWorkflow(id, userId);
     return NextResponse.json({ workflowId });
   } catch (error) {
     if (error instanceof Error && error.message === "Add a business goal before starting the workflow") return NextResponse.json({ error: error.message }, { status: 400 });
     if (error instanceof WorkflowLimitError) return NextResponse.json({ error: error.message }, { status: 429 });
+    if (error instanceof UserLimitError) return NextResponse.json({ error: error.message }, { status: 429 });
     if (error instanceof WorkflowPreflightError) {
       const failure = workflowFailure(error.code);
       return NextResponse.json({ error: failure.message, code: failure.code }, { status: 503 });

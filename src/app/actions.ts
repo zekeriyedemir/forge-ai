@@ -5,6 +5,8 @@ import { redirect } from "next/navigation";
 import { db } from "@/lib/db";
 import { authenticatedUserId, projectForOwner, requireUser, workspaceForUser } from "@/lib/access";
 import { goalInput, projectInput } from "@/lib/validation";
+import { assertUserLimit, UserLimitError } from "@/lib/user-limits";
+import { Prisma } from "@prisma/client";
 
 export async function createProject(formData: FormData) {
   const userId = await requireUser();
@@ -12,7 +14,16 @@ export async function createProject(formData: FormData) {
   if (!parsed.success) throw new Error("Enter a project name (2–80 characters), a goal (10–2,000 characters), and a description of up to 2,000 characters.");
   const input = parsed.data;
   const workspace = await workspaceForUser(userId);
-  const project = await db.project.create({ data: { workspaceId: workspace.id, name: input.name, description: input.description, goals: { create: { statement: input.goal } }, activity: { create: { kind: "project", message: "Project created" } } } });
+  let project: { id: string };
+  try {
+    project = await db.$transaction(async tx => {
+      await assertUserLimit(tx, userId, "projects");
+      return tx.project.create({ data: { workspaceId: workspace.id, name: input.name, description: input.description, goals: { create: { statement: input.goal } }, activity: { create: { kind: "project", message: "Project created" } } } });
+    }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+  } catch (error) {
+    if (error instanceof UserLimitError) redirect("/dashboard/projects?error=project_limit");
+    throw error;
+  }
   revalidatePath("/dashboard/projects");
   redirect(`/dashboard/projects/${project.id}`);
 }

@@ -9,6 +9,7 @@ const state = vi.hoisted(() => ({ owner: true, failTransaction: false, approvals
 vi.mock("@/lib/access", () => ({ projectForOwner: vi.fn(async () => state.owner ? { id: "project-id" } : null) }));
 vi.mock("@/lib/github", () => ({ githubToken: vi.fn() }));
 vi.mock("./proposal", () => ({ generateDeveloperProposal: vi.fn(), generateCiFixProposal: vi.fn() }));
+vi.mock("../user-limits", () => ({ assertUserLimit: vi.fn(), UserLimitError: class UserLimitError extends Error {} }));
 vi.mock("@/lib/db", () => {
   const client = {
     task: { findFirst: vi.fn(async ({ where }: any) => where.id === state.task.id && where.projectId === state.task.projectId ? state.task : null) },

@@ -9,6 +9,7 @@ import { DeveloperFlowError, createCiCorrection, createDeveloperProposal, decide
 import { DeveloperProposalError, RepositoryValidationError } from "@/lib/developer/diagnostics";
 import { DeveloperGitHubError } from "@/lib/developer/github";
 import { AiProviderError } from "@/lib/agents/provider";
+import { UserLimitError } from "@/lib/user-limits";
 
 async function identity(projectId: string) {
   z.uuid().parse(projectId);
@@ -26,6 +27,7 @@ function destination(projectId: string, error?: string) {
 
 function message(error: unknown) {
   if (error instanceof DeveloperProposalError) return error.publicMessage;
+  if (error instanceof UserLimitError) return error.message;
   if (error instanceof DeveloperFlowError || error instanceof AiProviderError || error instanceof DeveloperGitHubError || error instanceof RepositoryValidationError) return error.message;
   return "Operation failed. Review the project activity and retry.";
 }

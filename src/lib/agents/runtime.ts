@@ -8,11 +8,12 @@ import { assertResearchAvailable, researchProviderConfigured, researchProviderFr
 import { collectResearch, researchReport, type ResearchResult } from "../research/runtime";
 import { ResearchSynthesisError } from "../research/synthesis";
 import { SKIPPED_ERROR, workflowFailure, type WorkflowFailureCode } from "./workflow-status";
+import { assertUserLimit } from "../user-limits";
 
 export const sequence: AgentType[] = ["FOUNDER", "RESEARCH", "FOUNDER", "DEVELOPER", "ANALYST"];
 const runInput = z.object({ goal: z.string().trim().min(10).max(2000) });
 export class WorkflowLimitError extends Error {
-  constructor() { super("Workflow limit reached. Try again later."); }
+  constructor() { super("Workflow limit reached for this project. Wait an hour before starting another workflow."); }
 }
 export class WorkflowPreflightError extends Error {
   readonly code: WorkflowFailureCode;
@@ -40,7 +41,7 @@ function failureDetails(error: unknown) {
   return workflowFailure(error instanceof ZodError ? "INVALID_RESULT" : "EXECUTION_FAILED");
 }
 
-export async function startWorkflow(projectId: string) {
+export async function startWorkflow(projectId: string, userId: string) {
     if (process.env.DEMO_MODE !== "true") {
       // Resume active work without repeating a search probe. Recheck inside the
       // transaction below so concurrent starts still create only one workflow.
@@ -58,8 +59,11 @@ export async function startWorkflow(projectId: string) {
       catch (error) { throw new WorkflowPreflightError(failureDetails(error).code); }
     }
     return serializable(async tx => {
+      const owned = await tx.project.findFirst({ where: { id: projectId, workspace: { members: { some: { userId, role: "OWNER" } } } }, select: { id: true } });
+      if (!owned) throw new Error("Project not found or access denied");
       const existing = await tx.agentRun.findFirst({ where: { projectId, status: { in: ["PENDING", "RUNNING"] } } });
       if (existing) return existing.workflowId;
+      await assertUserLimit(tx, userId, "workflows");
       const recent = await tx.agentRun.count({ where: { projectId, type: "FOUNDER", step: 0, createdAt: { gt: new Date(Date.now() - 60 * 60 * 1000) } } });
       if (recent >= 5) throw new WorkflowLimitError();
       const goal = await tx.businessGoal.findFirst({ where: { projectId }, orderBy: { createdAt: "desc" } });
