@@ -12,7 +12,7 @@ Start Docker Desktop (or a Docker daemon with Compose), then run:
 npm run research:start
 ```
 
-This starts only the research container, so it also works when Forge uses Neon. The script creates a random SearXNG secret in ignored `.local/searxng/settings.yml`, retains that configuration on later starts, and waits for the container to become healthy. The pinned official image is bound to `127.0.0.1:8080`; JSON search is enabled in the supplied configuration. No search API key is required.
+This starts only the research container using `docker-compose.research.yml`, independently of the local PostgreSQL Compose configuration, so it also works when Forge uses Neon without local Postgres credentials. The script creates a random SearXNG secret in ignored `.local/searxng/settings.yml`, retains that configuration on later starts, and waits for the container to become healthy. The pinned official image is bound to `127.0.0.1:8080`; JSON search is enabled in the supplied configuration. No search API key is required.
 
 Set these values in `.env`, retaining your existing database, auth, and AI configuration:
 
@@ -28,7 +28,7 @@ Restart Forge after changing environment variables. Check that the search API re
 curl --fail --get 'http://localhost:8080/search' --data-urlencode 'q=customer support software' --data 'format=json'
 ```
 
-Use `docker compose --profile research logs --tail 50 searxng` to diagnose startup, and `docker compose --profile research stop searxng` to stop it without removing data. Start it again with `npm run research:start`. The local configuration disables the public-instance limiter; use the [official SearXNG deployment guidance](https://docs.searxng.org/admin/installation-docker.html) for a hosted service. Forge must reach the configured endpoint from its own server; a local laptop's `localhost` is not reachable from a deployed application.
+Use `docker compose -f docker-compose.research.yml logs --tail 50 searxng` to diagnose startup, and `docker compose -f docker-compose.research.yml stop searxng` to stop it without removing data. Start it again with `npm run research:start`. The local configuration disables the public-instance limiter; use the [official SearXNG deployment guidance](https://docs.searxng.org/admin/installation-docker.html) for a hosted service. Forge must reach the configured endpoint from its own server; a local laptop's `localhost` is not reachable from a deployed application.
 
 The Brave key uses the [Web Search API](https://api-dashboard.search.brave.com/api-reference/web/search/get) `X-Subscription-Token` header; Forge calls the fixed `https://api.search.brave.com/res/v1/web/search` endpoint. SearXNG is expected to be served from a self-hosted endpoint you control under your own domain or private network. Do not hard-code a third-party public SearXNG instance or assume a shared public instance is production-safe or always available.
 

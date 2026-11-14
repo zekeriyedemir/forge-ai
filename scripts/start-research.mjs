@@ -22,7 +22,7 @@ if (!existsSync(settingsPath)) {
   writeFileSync(settingsPath, settings, { flag: "wx", mode: 0o644 });
 }
 
-const started = spawnSync("docker", ["compose", "--profile", "research", "up", "--detach", "--wait", "--wait-timeout", "90", "searxng"], { cwd: root, stdio: "inherit" });
+const started = spawnSync("docker", ["compose", "-f", "docker-compose.research.yml", "up", "--detach", "--wait", "--wait-timeout", "90", "searxng"], { cwd: root, stdio: "inherit" });
 if (started.status !== 0) process.exit(started.status ?? 1);
 console.log("Research search is running at http://localhost:8080.");
 console.log('Set RESEARCH_PROVIDER="searxng" and RESEARCH_SEARXNG_BASE_URL="http://localhost:8080" in .env, then restart Forge.');
