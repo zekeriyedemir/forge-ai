@@ -15,6 +15,7 @@ const schema = z.object({
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_BASE_URL: z.url().regex(/^https?:\/\//).optional(),
   OPENAI_MODEL: z.string().default("gpt-4o-mini"),
+  OPENAI_PROPOSAL_MODEL: z.string().trim().min(1).optional(),
   ...userLimitSchema.shape,
   OPENAI_TOKEN_PARAMETER: z.enum(["max_completion_tokens", "max_tokens"]).default("max_completion_tokens"),
   OPENAI_JSON_MODE: z.enum(["true", "false"]).default("true"),

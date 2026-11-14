@@ -98,6 +98,7 @@ Keep values in ignored `.env` files or your host's secret settings. See [.env.ex
 | `OPENAI_API_KEY` | Server-only credential for live AI; not needed by `/demo` or deterministic mode. |
 | `OPENAI_BASE_URL` | Compatible API base; defaults to `https://api.openai.com/v1`. Set to `https://openrouter.ai/api/v1` when using OpenRouter. |
 | `OPENAI_MODEL` | Model identifier at the configured API; defaults to `gpt-4o-mini`. Choose one that returns final assistant text; JSON mode alone cannot make a reasoning-only model usable. |
+| `OPENAI_PROPOSAL_MODEL` | Optional Developer proposal/correction model; defaults to `OPENAI_MODEL`. Workflow and Research continue using `OPENAI_MODEL`. |
 | `OPENAI_TOKEN_PARAMETER` | `max_completion_tokens` (default) or `max_tokens`, according to the configured provider/model. |
 | `OPENAI_JSON_MODE` | `true` (default) sends Chat Completions JSON mode; set `false` only if the selected model/API does not support it. Forge still validates returned JSON. |
 | `RESEARCH_PROVIDER` | `auto`, `searxng`, or `brave`. Auto prefers configured SearXNG. |

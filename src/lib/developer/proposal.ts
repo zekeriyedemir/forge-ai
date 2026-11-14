@@ -173,7 +173,7 @@ async function generate(task: string, context: Context, failure?: { summary: str
     try {
       response = await fetch(`${(env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "")}/chat/completions`, {
         method: "POST", headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: env.OPENAI_MODEL, ...completionOptions(env, env.DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS), messages }), signal: requestSignal, cache: "no-store", redirect: "error",
+        body: JSON.stringify({ model: env.OPENAI_PROPOSAL_MODEL ?? env.OPENAI_MODEL, ...completionOptions(env, env.DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS), messages }), signal: requestSignal, cache: "no-store", redirect: "error",
       });
     } catch {
       throw requestSignal.aborted

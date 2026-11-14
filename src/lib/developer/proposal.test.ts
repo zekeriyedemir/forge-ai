@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const config = vi.hoisted(() => ({ demoMode: "false", tokenParameter: "max_completion_tokens", jsonMode: "true" }));
-vi.mock("@/lib/env", () => ({ serverEnv: () => ({ DEMO_MODE: config.demoMode, OPENAI_API_KEY: "test-only", OPENAI_MODEL: "test-model", OPENAI_BASE_URL: "https://example.test/v1", OPENAI_TOKEN_PARAMETER: config.tokenParameter, OPENAI_JSON_MODE: config.jsonMode, DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS: 8192 }) }));
+const config = vi.hoisted(() => ({ demoMode: "false", tokenParameter: "max_completion_tokens", jsonMode: "true", proposalModel: undefined as string | undefined }));
+vi.mock("@/lib/env", () => ({ serverEnv: () => ({ DEMO_MODE: config.demoMode, OPENAI_API_KEY: "test-only", OPENAI_MODEL: "test-model", OPENAI_PROPOSAL_MODEL: config.proposalModel, OPENAI_BASE_URL: "https://example.test/v1", OPENAI_TOKEN_PARAMETER: config.tokenParameter, OPENAI_JSON_MODE: config.jsonMode, DEVELOPER_PROPOSAL_MAX_COMPLETION_TOKENS: 8192 }) }));
 import { generateCiFixProposal, generateDeveloperProposal, PROPOSAL_AI_TIMEOUT_MS } from "./proposal";
 import { DeveloperProposalError } from "./diagnostics";
 import { proposalSchema } from "./contracts";
@@ -11,7 +11,7 @@ const proposal = { task: "Improve home page", summary: "Render a useful welcome 
 
 const jsonResponse = (payload: unknown, status = 200) => new Response(JSON.stringify(payload), { status });
 
-beforeEach(() => { config.demoMode = "false"; config.tokenParameter = "max_completion_tokens"; config.jsonMode = "true"; vi.unstubAllGlobals(); });
+beforeEach(() => { config.demoMode = "false"; config.tokenParameter = "max_completion_tokens"; config.jsonMode = "true"; config.proposalModel = undefined; vi.unstubAllGlobals(); });
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe("Developer structured output", () => {
@@ -40,6 +40,29 @@ describe("Developer structured output", () => {
     expect(body.max_tokens).toBe(8192);
     expect(body.max_completion_tokens).toBeUndefined();
     expect(body.response_format).toBeUndefined();
+  });
+
+  it("uses the optional proposal model for both Developer proposals and CI corrections", async () => {
+    config.proposalModel = "proposal-model";
+    const fix = { ...proposal, failureSummary: "The TypeScript check failed on the page.", likelyCause: "The page used an incompatible component type." };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(proposal) } }] }))
+      .mockResolvedValueOnce(jsonResponse({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(fix) } }] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await generateDeveloperProposal("Improve home page", context);
+    await generateCiFixProposal("Improve home page", context, { summary: "Typecheck failed.", diagnostics: ["TypeScript TS2322"] });
+
+    expect(fetchMock.mock.calls.map(call => JSON.parse(call[1].body).model)).toEqual(["proposal-model", "proposal-model"]);
+  });
+
+  it("falls back to OPENAI_MODEL when the proposal model is unset", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ choices: [{ finish_reason: "stop", message: { content: JSON.stringify(proposal) } }] }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await generateDeveloperProposal("Improve home page", context);
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).model).toBe("test-model");
   });
 
   it("handles interrupted provider bodies without echoing response details", async () => {
