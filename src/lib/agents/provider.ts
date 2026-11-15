@@ -27,7 +27,7 @@ const completionSchema = z.object({ error: z.unknown().optional(), choices: z.ar
 const maxAttempts = 2;
 // Fetch cancellation also covers response-body reads. Two attempts leave room
 // for database persistence in the 120s route budget.
-export const AGENT_REQUEST_TIMEOUT_MS = 40_000;
+export const AGENT_REQUEST_TIMEOUT_MS = 50_000;
 
 function recordRetry(kind: AgentKind, attempt: number, code: AiProviderErrorCode) {
   // Fixed metadata only: never log provider bodies, prompts, URLs, or credentials.

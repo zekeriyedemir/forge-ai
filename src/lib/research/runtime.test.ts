@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { researchQueries, validateEvidence } from "./contracts";
+import { researchKeywords, researchQueries, validateEvidence } from "./contracts";
 import { collectResearch, researchReport, sanitizeResearchError } from "./runtime";
 import type { ResearchProvider } from "./provider";
 
@@ -55,6 +55,15 @@ describe("bounded evidence-backed research", () => {
     expect(researchQueries("Build a customer support product")).toHaveLength(5);
     expect(researchQueries("Build a customer support product").every(query => query.length <= 220)).toBe(true);
     expect(() => researchQueries("hello")).toThrow("specific business goal");
+  });
+
+  it("removes conversational filler while preserving the business subject in search queries", () => {
+    const queries = researchQueries("I'm building a dress site that customers can design how they want, including material; they can control colors, fit, and features and place orders online; mostly wedding dress.");
+    expect(queries).toHaveLength(5);
+    expect(queries.every(query => query.includes("wedding dress"))).toBe(true);
+    expect(queries.some(query => query.includes("wedding dress competitors pricing alternatives"))).toBe(true);
+    expect(queries.every(query => query.length <= 220)).toBe(true);
+    expect(researchKeywords("I'm building a dress site that customers can design how they want, including material; they can control colors, fit, and features and place orders online; mostly wedding dress.")).toEqual(expect.arrayContaining(["material", "wedding", "dress"]));
   });
 
   it("creates no finding if all page retrievals fail", async () => {

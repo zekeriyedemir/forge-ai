@@ -84,6 +84,8 @@ Open [localhost:3000](http://localhost:3000). `/demo` works without configuratio
 
 For real sign-in, register a [GitHub OAuth app](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app) with callback `http://localhost:3000/api/auth/callback/github`. Set the GitHub variables below and `DEMO_MODE=false`. The requested `repo` scope includes private repository access; use a disposable repository when evaluating code changes.
 
+For real workflows without a paid AI API, use the [local Ollama setup](docs/local-ai.md). It runs inference on your machine; live research still needs SearXNG.
+
 ## Environment variables
 
 Keep values in ignored `.env` files or your host's secret settings. See [.env.example](.env.example).
@@ -101,8 +103,8 @@ Keep values in ignored `.env` files or your host's secret settings. See [.env.ex
 | `MAX_PROJECTS_PER_USER` | Maximum projects per user; default `10`. |
 | `MAX_WORKFLOW_STARTS_PER_USER_PER_DAY` | Maximum workflow starts per user in a rolling 24-hour window; default `20`. The existing per-project hourly cap also applies. |
 | `MAX_DEVELOPER_PROPOSALS_PER_USER_PER_DAY` | Maximum Developer proposals per user in a rolling 24-hour window; default `5`. |
-| `OPENAI_API_KEY` | Server-only credential for live AI; not needed by `/demo` or deterministic mode. |
-| `OPENAI_BASE_URL` | Compatible API base; defaults to `https://api.openai.com/v1`. Set to `https://openrouter.ai/api/v1` when using OpenRouter. |
+| `OPENAI_API_KEY` | Server-only credential for hosted AI; use the placeholder `ollama` with the local Ollama setup. |
+| `OPENAI_BASE_URL` | Compatible API base; defaults to `https://api.openai.com/v1`. Use `http://localhost:11434/v1` for local Ollama. |
 | `OPENAI_MODEL` | Model identifier at the configured API; defaults to `gpt-4o-mini`. Choose one that returns final assistant text; JSON mode alone cannot make a reasoning-only model usable. |
 | `OPENAI_PROPOSAL_MODEL` | Optional Developer proposal/correction model; defaults to `OPENAI_MODEL`. Workflow and Research continue using `OPENAI_MODEL`. |
 | `OPENAI_TOKEN_PARAMETER` | `max_completion_tokens` (default) or `max_tokens`, according to the configured provider/model. |
