@@ -59,7 +59,7 @@ beforeEach(() => {
   mocks.findGoal.mockResolvedValue({ statement: "Build a useful service" });
   mocks.upsertAgent.mockResolvedValue({ id: "agent-id" });
   mocks.updateMany.mockResolvedValue({ count: 1 });
-  mocks.readContext.mockResolvedValue({ goals: [{ statement: "Build a useful service" }], tasks: [], reports: [], metrics: [] });
+  mocks.readContext.mockResolvedValue({ goals: [{ statement: "Build a useful service" }], tasks: [], reports: [], metrics: [], _count: { tasks: 0, reports: 0, metrics: 0 } });
   mocks.generate.mockResolvedValue({ summary: "Ready", tasks: [], reports: [], metrics: [] });
   mocks.createSession.mockResolvedValue({ id: "session-id" });
   mocks.createSource.mockResolvedValue({ id: "source-id" });
@@ -272,9 +272,24 @@ describe("workflow persistence", () => {
     expect(mocks.createReport).toHaveBeenCalledOnce();
     expect(mocks.generate).not.toHaveBeenCalled();
     mocks.findRun.mockResolvedValue({ id: "founder-run", type: "FOUNDER", step: 2, status: "PENDING" });
-    mocks.findSession.mockResolvedValue({ findings: [{ area: "DEMAND", claim: "Possible need", quote: "exact source quote", limitation: "One page", source: { url: "https://example.org/page" } }] });
+    mocks.findSession.mockResolvedValue({ sources: [{ id: "source-id" }], findings: [{ area: "DEMAND", claim: "Possible need", quote: "exact source quote", limitation: "One page", source: { url: "https://example.org/page" } }] });
     await advanceWorkflow(projectId, workflowId);
     expect(JSON.parse(mocks.generate.mock.calls[0][2]).verifiedResearch).toEqual([{ area: "DEMAND", claim: "Possible need", quote: "exact source quote", url: "https://example.org/page", limitation: "One page" }]);
+  });
+
+  it("provides completed workflow research to Analyst for evidence-backed summaries", async () => {
+    mocks.findRun.mockResolvedValue({ id: "analyst-run", type: "ANALYST", step: 4, status: "PENDING" });
+    mocks.readContext.mockResolvedValue({ goals: [{ statement: "Build a useful service" }], tasks: [{ title: "Task" }], reports: [{ title: "Report" }], metrics: [], _count: { tasks: 12, reports: 7, metrics: 2 } });
+    mocks.findSession.mockResolvedValue({ sources: [{ id: "source-id" }, { id: "source-2" }], findings: [{ area: "DEMAND", claim: "Possible need", quote: "exact source quote", limitation: "One page", source: { url: "https://example.org/page" } }] });
+
+    await advanceWorkflow(projectId, workflowId);
+
+    expect(mocks.findSession).toHaveBeenCalledWith(expect.objectContaining({ where: { projectId, run: { workflowId }, status: "COMPLETED" } }));
+    expect(JSON.parse(mocks.generate.mock.calls[0][2])).toMatchObject({
+      projectCounts: { tasks: 12, reports: 7, metrics: 2 },
+      workflowResearchCounts: { sources: 2, findings: 1 },
+      verifiedResearch: [{ area: "DEMAND", claim: "Possible need", quote: "exact source quote", url: "https://example.org/page", limitation: "One page" }],
+    });
   });
 
   it("fails live research visibly when the search provider is not configured", async () => {
