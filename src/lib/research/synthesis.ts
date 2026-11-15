@@ -1,5 +1,5 @@
 import { serverEnv } from "../env";
-import { researchAnalysis, validateEvidence, type ResearchAnalysis, type ResearchEvidence } from "./contracts";
+import { researchAnalysis, researchKeywords, validateEvidence, type ResearchAnalysis, type ResearchEvidence } from "./contracts";
 import { z } from "zod";
 import { completionOptions } from "../agents/completion-options";
 
@@ -10,7 +10,13 @@ export class ResearchSynthesisError extends Error {
     this.name = "ResearchSynthesisError";
   }
 }
-export const RESEARCH_SYNTHESIS_TIMEOUT_MS = 35_000;
+export const RESEARCH_SYNTHESIS_TIMEOUT_MS = 45_000;
+
+function isLoopbackInference(baseUrl?: string): boolean {
+  if (!baseUrl) return false;
+  const hostname = new URL(baseUrl).hostname.replace(/^\[|\]$/g, "");
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+}
 
 function isTimeoutLike(error: unknown): boolean {
   for (let depth = 0; depth < 3 && error && typeof error === "object"; depth++) {
@@ -48,11 +54,29 @@ async function synthesizeResearchInternal(goal: string, sources: ResearchEvidenc
   catch { throw new ResearchSynthesisError("Server research AI configuration is incomplete."); }
   if (env.DEMO_MODE === "true") throw new ResearchSynthesisError("Live research is unavailable in demo mode.");
   if (!env.OPENAI_API_KEY) throw new ResearchSynthesisError("AI provider is NOT CONFIGURED for research synthesis.");
+  const localInference = isLoopbackInference(env.OPENAI_BASE_URL);
+  const keywords = localInference ? researchKeywords(goal) : [];
+  const sourceEntries = sources.map((source, sourceIndex) => ({ source, sourceIndex }));
+  const researchSources = localInference
+    ? sourceEntries
+      .map(entry => {
+        const text = `${entry.source.title} ${entry.source.excerpt}`.toLowerCase();
+        const score = keywords.reduce((total, keyword) => total + text.split(keyword).length - 1, 0);
+        return { ...entry, score };
+      })
+      .sort((left, right) => right.score - left.score || left.sourceIndex - right.sourceIndex)
+      .slice(0, 2)
+      .sort((left, right) => left.sourceIndex - right.sourceIndex)
+    : sourceEntries;
+  const excerptLimit = localInference ? 600 : 6_000;
+  const promptSources = researchSources.map(({ source, sourceIndex }) => ({ sourceIndex, title: source.title, url: source.url, excerpt: source.excerpt.slice(0, excerptLimit) }));
+  const visibleSources = sources.map((source, sourceIndex) => ({ ...source, excerpt: promptSources.find(prompt => prompt.sourceIndex === sourceIndex)?.excerpt ?? "" }));
   const messages = [
     { role: "system", content: SYSTEM },
-    { role: "user", content: JSON.stringify({ goal: goal.slice(0, 2000), sources: sources.map((source, sourceIndex) => ({ sourceIndex, title: source.title, url: source.url, excerpt: source.excerpt.slice(0, 6_000) })) }) },
+    { role: "user", content: JSON.stringify({ goal: goal.slice(0, 2000), sources: promptSources }) },
   ];
-  let completionBudget = 4096;
+  if (localInference) messages.push({ role: "user", content: "For this local run, return at most three concise findings. Use exact quotes and cite only sources whose excerpts support the claims." });
+  let completionBudget = localInference ? 1_024 : 4_096;
   // One shared retry budget covers transient failures, truncation, and repairs.
   // Two request timeouts leave room for search/retrieval within the route limit.
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -61,7 +85,7 @@ async function synthesizeResearchInternal(goal: string, sources: ResearchEvidenc
       response = await fetch(`${(env.OPENAI_BASE_URL ?? "https://api.openai.com/v1").replace(/\/+$/, "")}/chat/completions`, {
         method: "POST",
         headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: env.OPENAI_MODEL, ...completionOptions(env, completionBudget), messages }),
+        body: JSON.stringify({ model: env.OPENAI_MODEL, ...completionOptions(env, completionBudget), ...(localInference ? { temperature: 0 } : {}), messages }),
         signal: AbortSignal.timeout(RESEARCH_SYNTHESIS_TIMEOUT_MS),
         cache: "no-store",
         redirect: "error",
@@ -92,7 +116,7 @@ async function synthesizeResearchInternal(goal: string, sources: ResearchEvidenc
     if (parsedEnvelope.success && (parsedEnvelope.data.error != null || choice?.error != null)) throw new ResearchSynthesisError("Research AI provider returned an error instead of an analysis.", "AI_UNAVAILABLE");
     if ([choice?.finish_reason, choice?.native_finish_reason].some(reason => ["length", "max_tokens", "max_output_tokens"].includes(reason ?? ""))) {
       if (attempt === 1) throw new ResearchSynthesisError("Research AI output exceeded its completion budget after one retry. Choose a model with a larger output limit.", "AI_INVALID_RESULT");
-      completionBudget = 8192;
+      completionBudget = localInference ? 2_048 : 8_192;
       messages.push({ role: "user", content: "The prior completion reached its output limit. Generate a fresh, concise JSON object with 1-4 findings and exact source quotes. Return the complete object only, without a continuation or extra prose." });
       continue;
     }
@@ -106,7 +130,7 @@ async function synthesizeResearchInternal(goal: string, sources: ResearchEvidenc
     }
     try {
       const value = researchAnalysis.parse(JSON.parse(content.trim()));
-      const validated = validateEvidence(value, sources);
+      const validated = validateEvidence(value, visibleSources);
       return validated;
     } catch {
       if (attempt === 1) break;

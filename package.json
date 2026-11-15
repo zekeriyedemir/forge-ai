@@ -8,6 +8,7 @@
   "scripts": {
     "postinstall": "prisma generate",
     "dev": "next dev",
+    "ai:start": "node scripts/start-local-ai.mjs",
     "research:start": "node scripts/start-research.mjs",
     "build": "next build --webpack",
     "start": "next start",

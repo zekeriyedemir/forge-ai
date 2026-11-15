@@ -52,6 +52,8 @@ describe("agent provider", () => {
     const request = JSON.parse(fetchMock.mock.calls[0][1].body);
     expect(request.response_format).toEqual({ type: "json_object" });
     expect(request.messages[0].content).toContain("Metric keys must be unique ASCII lowercase snake_case");
+    expect(request.messages[0].content).toContain("Never invent aggregate counts");
+    expect(request.messages[0].content).toContain("Use projectCounts and workflowResearchCounts as the only sources");
     expect(console.warn).not.toHaveBeenCalled();
   });
 

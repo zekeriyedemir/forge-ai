@@ -113,11 +113,20 @@ export async function advanceWorkflow(projectId: string, workflowId: string) {
     } else {
       const ai = run.type === "RESEARCH" && process.env.DEMO_MODE === "true" ? demoProvider() : provider();
       let verifiedResearch: { area: string; claim: string; quote: string; url: string; limitation: string }[] = [];
-      if (run.type === "FOUNDER" && run.step > 0) {
-        const session = await db.researchSession.findFirst({ where: { projectId, run: { workflowId }, status: "COMPLETED" }, include: { findings: { include: { source: true }, take: 8 } } });
+      let workflowResearchCounts: { sources: number; findings: number } | undefined;
+      if (run.type === "ANALYST" || (run.type === "FOUNDER" && run.step > 0)) {
+        const session = await db.researchSession.findFirst({ where: { projectId, run: { workflowId }, status: "COMPLETED" }, include: { sources: { select: { id: true } }, findings: { include: { source: true }, take: 8 } } });
         verifiedResearch = session?.findings.map(finding => ({ area: finding.area, claim: finding.claim, quote: finding.quote, url: finding.source.url, limitation: finding.limitation })) ?? [];
+        if (session) workflowResearchCounts = { sources: session.sources.length, findings: session.findings.length };
       }
-      result = resultSchema.parse(await ai.generate(run.type, goal, JSON.stringify({ tasks: context.tasks.map(t => t.title), reports: context.reports.map(r => r.title), metrics: context.metrics, verifiedResearch })));
+      result = resultSchema.parse(await ai.generate(run.type, goal, JSON.stringify({
+        tasks: context.tasks.map(t => t.title),
+        reports: context.reports.map(r => r.title),
+        metrics: context.metrics,
+        projectCounts: context._count,
+        ...(workflowResearchCounts ? { workflowResearchCounts } : {}),
+        verifiedResearch,
+      })));
       providerName = ai.name;
       modelName = ai.model;
     }

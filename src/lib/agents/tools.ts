@@ -32,7 +32,7 @@ export const tools = {
   },
   async updateMetric(ctx: ToolContext, input: unknown) { return this.saveMetric(ctx, input); },
   async readProjectContext(ctx: ToolContext) {
-    return db.project.findUniqueOrThrow({ where: { id: ctx.projectId }, include: { goals: { orderBy: { createdAt: "desc" }, take: 1 }, tasks: { take: 20 }, reports: { orderBy: { createdAt: "desc" }, take: 5 }, metrics: true } });
+    return db.project.findUniqueOrThrow({ where: { id: ctx.projectId }, include: { goals: { orderBy: { createdAt: "desc" }, take: 1 }, tasks: { take: 20 }, reports: { orderBy: { createdAt: "desc" }, take: 5 }, metrics: true, _count: { select: { tasks: true, reports: true, metrics: true } } } });
   },
   async listProjectTasks(ctx: ToolContext) { return db.task.findMany({ where: { projectId: ctx.projectId }, orderBy: { createdAt: "desc" } }); },
   async listProjectReports(ctx: ToolContext) { return db.report.findMany({ where: { projectId: ctx.projectId }, orderBy: { createdAt: "desc" } }); },

@@ -28,14 +28,29 @@ export function validateEvidence(analysis: ResearchAnalysis, sources: ResearchEv
   return checked;
 }
 
-export function researchQueries(goal: string) {
-  const subject = goal.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 120);
+const researchStopWords = new Set(["a", "am", "an", "and", "are", "as", "at", "be", "but", "build", "building", "can", "could", "color", "colors", "control", "create", "creating", "customer", "customers", "do", "does", "each", "even", "everything", "feature", "features", "fit", "for", "from", "he", "her", "his", "how", "i", "im", "in", "into", "is", "it", "its", "make", "making", "mostly", "of", "on", "online", "or", "order", "orders", "pay", "place", "platform", "she", "site", "that", "the", "they", "this", "to", "wait", "want", "wants", "we", "website", "what", "with", "would", "you", "your"]);
+
+export function researchKeywords(goal: string) {
+  const subject = goal.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
   if (subject.length < 10) throw new Error("A specific business goal is required for live research.");
+  const words = subject.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+  const seen = new Set<string>();
+  const keywords = words.reverse().filter(word => {
+    if (researchStopWords.has(word) || seen.has(word)) return false;
+    seen.add(word);
+    return true;
+  }).reverse();
+  return keywords.slice(-6);
+}
+
+export function researchQueries(goal: string) {
+  const subject = goal.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+  const researchSubject = (researchKeywords(subject).join(" ") || subject).slice(0, 120);
   return [
-    `${subject} market demand evidence`,
-    `${subject} competitors pricing alternatives`,
-    `${subject} customer pain target segments`,
-    `${subject} positioning business opportunities`,
-    `${subject} distribution acquisition channels`,
+    `${researchSubject} market demand evidence`,
+    `${researchSubject} competitors pricing alternatives`,
+    `${researchSubject} customer pain target segments`,
+    `${researchSubject} positioning business opportunities`,
+    `${researchSubject} distribution acquisition channels`,
   ];
 }
