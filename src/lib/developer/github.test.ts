@@ -32,6 +32,16 @@ describe("bounded GitHub writes", () => {
     await expect(new GitHubDeveloperClient("test-only").repository("owner/repo")).rejects.toThrow("GitHub denied this operation");
   });
 
+  it("explains GitHub's empty-repository conflict without exposing its response body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: false, status: 409, text: async () => "Git Repository is empty. private details" });
+    vi.stubGlobal("fetch", fetchMock);
+    const failure = await new GitHubDeveloperClient("test-only").ref("owner/repo", "main").catch(error => error);
+    expect(failure).toMatchObject({ status: 409 });
+    expect(failure.message).toContain("repository has no commits yet");
+    expect(failure.message).not.toContain("private details");
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("inspects the commit's tree and excludes symlinks from editable contents", async () => {
     const commitSha = "a".repeat(40);
     const treeSha = "b".repeat(40);

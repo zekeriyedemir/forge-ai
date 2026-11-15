@@ -227,6 +227,21 @@ describe("approved Developer execution", () => {
     expect(state.approvals).toHaveLength(0);
   });
 
+  it("reports an actionable empty-repository error before AI generation or persistence", async () => {
+    const { github } = fakeGitHub();
+    vi.mocked(github.ref).mockRejectedValueOnce(new DeveloperGitHubError("GitHub operation failed (409).", 409));
+
+    await expect(createDeveloperProposal("project-id", "task-id", "user-id", github, async () => proposal)).rejects.toMatchObject({
+      stage: "branch-base",
+      code: "EMPTY_REPOSITORY",
+      message: expect.stringContaining("initial commit to its default branch (main)"),
+    });
+
+    expect(state.executions).toHaveLength(0);
+    expect(state.approvals).toHaveLength(0);
+    expect(github.context).not.toHaveBeenCalled();
+  });
+
   it("distinguishes provider, structured-output, and final proposal validation failures", async () => {
     const cases = [
       { failure: new DeveloperProposalError("ai-provider", "RATE_LIMITED", "The AI provider rate limit was reached."), stage: "ai-provider", code: "RATE_LIMITED" },
