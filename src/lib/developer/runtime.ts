@@ -70,8 +70,17 @@ export async function createDeveloperProposal(projectId: string, taskId: string,
     if (existing) return existing;
     const { linked, github, remote } = await proposalStep("github-inspection", "REPOSITORY_ACCESS_FAILED", "Could not inspect the linked GitHub repository.", () => verifiedGitHub(projectId, userId, undefined, client));
     const { target, baseSha } = await proposalStep("branch-base", "BASE_RESOLUTION_FAILED", "Could not resolve the repository integration branch and base commit.", async () => {
-      const target = await github.ref(linked.fullName, "dev") ? "dev" : safeTarget(remote.default_branch);
-      const baseSha = await github.ref(linked.fullName, target);
+      const resolveRef = async (branch: string) => {
+        try { return await github.ref(linked.fullName, branch); }
+        catch (error) {
+          if (error instanceof DeveloperGitHubError && error.status === 409) {
+            throw new DeveloperProposalError("branch-base", "EMPTY_REPOSITORY", `This GitHub repository has no commits yet. Add an initial commit to its default branch (${safeTarget(remote.default_branch)}), then retry the proposal.`);
+          }
+          throw error;
+        }
+      };
+      const target = await resolveRef("dev") ? "dev" : safeTarget(remote.default_branch);
+      const baseSha = await resolveRef(target);
       if (!baseSha) throw new DeveloperProposalError("branch-base", "BASE_NOT_FOUND", "The selected integration branch has no readable base commit.");
       return { target, baseSha };
     });

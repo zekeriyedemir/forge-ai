@@ -9,7 +9,12 @@ const refSchema = z.object({ object: z.object({ sha: shaSchema }) });
 const commitSchema = z.object({ sha: shaSchema, tree: z.object({ sha: shaSchema }) });
 const pullSchema = z.object({ number: z.number().int().positive(), html_url: z.url().refine(url => new URL(url).origin === "https://github.com"), state: z.string(), mergeable: z.boolean().nullable().optional(), merged: z.boolean().optional(), head: z.object({ sha: shaSchema, ref: z.string(), repo: z.object({ id: z.number() }) }), base: z.object({ ref: z.string(), repo: z.object({ id: z.number() }) }) });
 
-export class DeveloperGitHubError extends Error {}
+export class DeveloperGitHubError extends Error {
+  constructor(message: string, readonly status?: number) {
+    super(message);
+    this.name = "DeveloperGitHubError";
+  }
+}
 export type RepoInfo = z.infer<typeof repoSchema>;
 export type PullInfo = z.infer<typeof pullSchema>;
 export type CiState = "PENDING" | "SUCCESS" | "FAILURE" | "CANCELLED" | "UNAVAILABLE";
@@ -97,7 +102,7 @@ export class GitHubDeveloperClient implements DeveloperGitHub {
     if (response.status === 401) throw new DeveloperGitHubError("GitHub authorization expired. Sign in again.");
     if (response.status === 403) throw new DeveloperGitHubError("GitHub denied this operation. Check repository permissions and branch protection.");
     if (response.status === 404) throw new DeveloperGitHubError("GitHub repository or resource was not found, or access was denied.");
-    if (!response.ok) throw new DeveloperGitHubError(`GitHub operation failed (${response.status}). Check GitHub and retry.`);
+    if (!response.ok) throw new DeveloperGitHubError(`GitHub operation failed (${response.status}). Check GitHub and retry.`, response.status);
     return response.json().catch(() => { throw new DeveloperGitHubError("GitHub returned an invalid response."); });
   }
 
@@ -106,7 +111,13 @@ export class GitHubDeveloperClient implements DeveloperGitHub {
     safeTarget(branch);
     const path = `${repoPath(fullName)}/git/ref/heads/${branch.split("/").map(encodeURIComponent).join("/")}`;
     try { return refSchema.parse(await this.request(path)).object.sha; }
-    catch (error) { if (error instanceof DeveloperGitHubError && error.message.includes("not found")) return null; throw error; }
+    catch (error) {
+      if (error instanceof DeveloperGitHubError && error.status === 409) {
+        throw new DeveloperGitHubError("This GitHub repository has no commits yet. Add an initial commit to its default branch, then retry the proposal.", 409);
+      }
+      if (error instanceof DeveloperGitHubError && error.message.includes("not found")) return null;
+      throw error;
+    }
   }
   async context(fullName: string, sha: string, task: string) {
     const root = repoPath(fullName);
